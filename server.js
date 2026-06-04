@@ -296,3 +296,44 @@ app.listen(PORT, () => {
   console.log(`\n🟢 Watch Auto-Poster running on port ${PORT}`);
   console.log(`   Set SECRET_KEY env var to protect your /save-cookies endpoint\n`);
 });
+// ─── DEBUG: Check login status ───
+app.get('/check-login', async (req, res) => {
+  const puppeteer = require('puppeteer');
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+
+    const cookiePath = '/tmp/fb-cookies.json';
+    if (fs.existsSync(cookiePath)) {
+      const raw = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
+      const cookies = raw.map(c => ({
+        name: c.name, value: c.value,
+        domain: c.domain || '.facebook.com',
+        path: c.path || '/', httpOnly: c.httpOnly || false,
+        secure: c.secure || false, sameSite: 'None'
+      }));
+      await page.setCookie(...cookies);
+    }
+
+    await page.goto('https://www.facebook.com', { waitUntil: 'networkidle2' });
+    await new Promise(r => setTimeout(r, 3000));
+
+    const result = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      hasLoginForm: !!document.querySelector('#loginform') || !!document.querySelector('[data-testid="royal_login_form"]'),
+      hasProfileLink: !!document.querySelector('[aria-label="Your profile"]'),
+      cookieNames: document.cookie.split(';').map(c => c.trim().split('=')[0]).filter(Boolean)
+    }));
+
+    res.json(result);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    await browser.close();
+  }
+});
