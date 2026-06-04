@@ -1,11 +1,7 @@
 /**
- * Watch Auto-Poster - Railway Server (FIXED)
+ * Watch Auto-Poster - Railway Server
  * 
- * This version has improved cookie handling and better validation.
- * Key fixes:
- * - Preserve all cookie properties exactly as saved
- * - Better error messages when login fails
- * - Validate c_user + xs/datr before attempting to post
+ * Uses persistent Chrome profile to maintain Facebook login across sessions.
  */
 
 const express = require('express');
@@ -17,6 +13,7 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3001;
 const COOKIE_PATH = '/tmp/fb-cookies.json';
+const PROFILE_DIR = '/tmp/chrome-profile';
 
 let currentSession = null;
 let posterRunning = false;
@@ -57,20 +54,20 @@ function saveCookies(cookies) {
     }));
 
   fs.writeFileSync(COOKIE_PATH, JSON.stringify(cleaned, null, 2));
-  console.log(`💾 Saved ${cleaned.length} cookies`);
+  console.log(`💾 Saved ${cleaned.length} cookies to disk`);
   return cleaned;
 }
 
 function loadCookies() {
   if (!fs.existsSync(COOKIE_PATH)) {
-    console.log('⚠️ No cookies file found');
+    console.log('⚠️ No cookies file found at', COOKIE_PATH);
     return [];
   }
 
   try {
     const raw = JSON.parse(fs.readFileSync(COOKIE_PATH, 'utf8'));
     const cookies = Array.isArray(raw) ? raw : [];
-    console.log(`📖 Loaded ${cookies.length} cookies`);
+    console.log(`📖 Loaded ${cookies.length} cookies from disk`);
     return cookies;
   } catch (err) {
     console.error('❌ Failed to parse cookies:', err.message);
@@ -80,13 +77,24 @@ function loadCookies() {
 
 async function launchBrowser() {
   const puppeteer = require('puppeteer');
+  
+  // Ensure profile directory exists
+  if (!fs.existsSync(PROFILE_DIR)) {
+    fs.mkdirSync(PROFILE_DIR, { recursive: true });
+    console.log(`📁 Created Chrome profile directory: ${PROFILE_DIR}`);
+  }
+
+  console.log(`🌐 Launching Chrome with persistent profile: ${PROFILE_DIR}`);
+  
   return puppeteer.launch({
     headless: 'new',
+    userDataDir: PROFILE_DIR,  // ← KEY: Use persistent profile
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu'
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled'
     ]
   });
 }
@@ -128,22 +136,22 @@ app.post('/save-cookies', (req, res) => {
     count: saved.length,
     savedCookieNames: names,
     hasCritical: hasCritical,
-    message: hasCritical ? '✅ Ready to post!' : '⚠️ Missing critical cookies'
+    message: hasCritical ? '✅ Cookies saved! Profile will import them on first posting session.' : '⚠️ Missing critical cookies'
   });
 });
 
 app.get('/check-login', async (req, res) => {
-  console.log('\n📋 /check-login: Testing Facebook access...');
+  console.log('\n📋 /check-login: Testing Facebook access with persistent profile...');
   const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
+    // Load saved cookies and apply them
     const cookies = loadCookies();
-    console.log(`📋 Applying ${cookies.length} cookies`);
-
     if (cookies.length > 0) {
+      console.log(`📋 Applying ${cookies.length} saved cookies to persistent profile`);
       try {
         await page.setCookie(...cookies);
       } catch (err) {
@@ -153,7 +161,7 @@ app.get('/check-login', async (req, res) => {
 
     console.log('📋 Navigating to facebook.com...');
     await page.goto('https://www.facebook.com/', { waitUntil: 'networkidle2' });
-    await sleep(3000);
+    await sleep(4000);
 
     const result = await page.evaluate(() => {
       const cookies = document.cookie.split(';').map(c => c.trim().split('=')[0]).filter(Boolean);
@@ -175,7 +183,8 @@ app.get('/check-login', async (req, res) => {
       browserCookieNames: browserNames,
       hasCritical: hasCritical,
       readyToPost: !result.hasLoginForm && hasCritical,
-      status: !result.hasLoginForm ? '✅ Logged in' : '❌ Not logged in'
+      status: !result.hasLoginForm ? '✅ Logged in' : '❌ Not logged in',
+      note: 'Profile will persist login across sessions'
     });
 
   } catch (err) {
@@ -244,19 +253,21 @@ async function runPoster() {
     page.setDefaultTimeout(30000);
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Load cookies
+    // Load and apply cookies to the persistent profile
     const cookies = loadCookies();
-    if (cookies.length === 0) {
-      throw new Error('No cookies saved. Run extract-cookies.js first.');
+    if (cookies.length > 0) {
+      console.log(`🍪 Applying ${cookies.length} cookies to persistent profile`);
+      try {
+        await page.setCookie(...cookies);
+      } catch (err) {
+        console.warn('⚠️ Some cookies failed to set:', err.message);
+      }
     }
-
-    console.log(`🍪 Setting ${cookies.length} cookies on page`);
-    await page.setCookie(...cookies);
 
     // Navigate to Facebook
     console.log('📄 Loading facebook.com...');
     await page.goto('https://www.facebook.com/', { waitUntil: 'networkidle2' });
-    await sleep(4000);
+    await sleep(5000);
 
     // Check if logged in
     const pageTitle = await page.title();
@@ -271,26 +282,10 @@ async function runPoster() {
     );
 
     if (isLoginPage) {
-      throw new Error('Facebook login page detected. Cookies are invalid or expired.');
+      throw new Error('Facebook login page detected. Cookies may be expired.');
     }
 
     console.log('✅ Logged into Facebook');
-
-    // Get current browser cookies to verify
-    const browserCookies = await page.cookies();
-    const browserNames = browserCookies.map(c => c.name);
-    const hasC_user = browserNames.includes('c_user');
-    const hasXs = browserNames.includes('xs');
-    const hasDatr = browserNames.includes('datr');
-
-    console.log(`🔑 Critical cookies: c_user=${hasC_user}, xs=${hasXs}, datr=${hasDatr}`);
-
-    if (!hasC_user) {
-      throw new Error('Missing c_user cookie. Not logged in properly.');
-    }
-    if (!hasXs && !hasDatr) {
-      throw new Error('Missing xs/datr cookie. Session not valid.');
-    }
 
     // Proceed with posting
     const pending = session.groups.filter(g => g.postStatus === 'pending' && g.link);
@@ -339,7 +334,7 @@ async function runPoster() {
         session.progress.done++;
         console.log(`   ✅ Posted!`);
 
-        // Refresh cookies
+        // Refresh cookies from persistent profile
         const updatedCookies = await page.cookies();
         saveCookies(updatedCookies);
 
@@ -430,5 +425,6 @@ async function clickPost(page) {
 }
 
 app.listen(PORT, () => {
-  console.log(`✅ Watch Auto-Poster running on port ${PORT}\n`);
+  console.log(`✅ Watch Auto-Poster running on port ${PORT}`);
+  console.log(`   Using persistent Chrome profile: ${PROFILE_DIR}\n`);
 });
