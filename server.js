@@ -285,18 +285,18 @@ async function runPoster() {
 
       try {
         await page.goto(group.link, { waitUntil: 'networkidle2', timeout: 30000 });
-        await sleep(4000 + rand(0, 2000));
+        await sleep(5000 + rand(0, 2000));
 
         const composerOpened = await openComposer(page);
         if (!composerOpened) throw new Error('Composer not found');
-        await sleep(1500);
+        await sleep(2000);
 
         await page.keyboard.type(session.caption, { delay: rand(30, 80) });
-        await sleep(1000);
+        await sleep(1500);
 
         if (session.imagePaths.length > 0) {
           await uploadImages(page, session.imagePaths);
-          await sleep(3000);
+          await sleep(4000);
         }
 
         const posted = await clickPost(page);
@@ -333,20 +333,68 @@ async function runPoster() {
 }
 
 async function openComposer(page) {
+  console.log('   Looking for post composer...');
+
+  // Try multiple selectors for different Facebook layouts
   const selectors = [
     '[aria-label="Write something to the group..."]',
+    '[aria-label="Write something to the group…"]',
     '[aria-label="Write something..."]',
-    '[data-testid="status-attachment-mentions-input"]'
+    '[aria-label*="Write something"]',
+    '[placeholder*="What"]',
+    '[placeholder*="เขียน"]',
+    'div[role="textbox"][contenteditable="true"]',
+    'div[data-lexical-editor="true"]'
   ];
 
+  // Try each selector
   for (const sel of selectors) {
     try {
-      await page.waitForSelector(sel, { timeout: 2000 });
-      await page.click(sel);
-      console.log(`   Composer: ${sel}`);
-      return true;
+      const elements = await page.$$(sel);
+      if (elements.length > 0) {
+        // Click the first matching element
+        await page.evaluate((selector) => {
+          const el = document.querySelector(selector);
+          if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.click();
+          }
+        }, sel);
+        
+        await sleep(1500);
+        console.log(`   ✓ Opened with: ${sel}`);
+        return true;
+      }
     } catch {}
   }
+
+  // Fallback: Try clicking a button that says "Write" or similar
+  try {
+    const foundButton = await page.evaluate(() => {
+      const buttons = document.querySelectorAll('button, [role="button"], div[role="button"]');
+      for (const btn of buttons) {
+        const text = btn.textContent.toLowerCase();
+        if (text.includes('write') || text.includes('post') || text.includes('เขียน')) {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (foundButton) {
+      await sleep(1500);
+      console.log(`   ✓ Opened by clicking button text`);
+      return true;
+    }
+  } catch {}
+
+  // Last resort: Take a screenshot for debugging
+  try {
+    await page.screenshot({ path: '/tmp/composer-not-found.png' });
+    console.log('   📸 Screenshot saved: /tmp/composer-not-found.png');
+  } catch {}
+
   return false;
 }
 
@@ -354,26 +402,67 @@ async function uploadImages(page, imagePaths) {
   const valid = imagePaths.filter(p => fs.existsSync(p));
   if (!valid.length) return;
 
+  console.log(`   Uploading ${valid.length} image(s)...`);
+
   let input = await page.$('input[type="file"]');
   if (input) {
     await input.uploadFile(...valid);
-    console.log(`   Uploaded ${valid.length} image(s)`);
+    console.log(`   ✓ Uploaded`);
+    return;
   }
+
+  // Try finding by accept attribute
+  input = await page.$('input[type="file"][accept*="image"]');
+  if (input) {
+    await input.uploadFile(...valid);
+    console.log(`   ✓ Uploaded`);
+    return;
+  }
+
+  console.log('   ⚠️ Could not find file input');
 }
 
 async function clickPost(page) {
-  const buttons = [
+  console.log('   Looking for Post button...');
+
+  const selectors = [
     '[aria-label="Post"]',
-    'button[aria-label*="Post"]'
+    'button[aria-label="Post"]',
+    'div[role="button"][aria-label="Post"]',
+    'button:has-text("Post")',
+    'button:has-text("โพสต์")'
   ];
 
-  for (const sel of buttons) {
-    const btn = await page.$(sel);
-    if (btn) {
-      await btn.click();
+  for (const sel of selectors) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        console.log(`   ✓ Clicked: ${sel}`);
+        return true;
+      }
+    } catch {}
+  }
+
+  // Fallback: Find button by text content
+  try {
+    const found = await page.evaluate(() => {
+      const buttons = document.querySelectorAll('button, [role="button"]');
+      for (const btn of buttons) {
+        if (btn.textContent.trim() === 'Post' || btn.textContent.trim() === 'โพสต์') {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (found) {
+      console.log(`   ✓ Clicked Post button by text`);
       return true;
     }
-  }
+  } catch {}
+
   return false;
 }
 
