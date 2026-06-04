@@ -370,3 +370,51 @@ app.listen(PORT, () => {
   console.log(`\n🟢 Watch Auto-Poster running on port ${PORT}`);
   console.log(`   Set SECRET_KEY env var to protect your /save-cookies endpoint\n`);
 });
+// ─── DEBUG: Check what's on a group page ───
+app.get('/check-group', async (req, res) => {
+  const groupUrl = req.query.url;
+  if (!groupUrl) return res.status(400).json({ error: 'Pass ?url=https://facebook.com/groups/...' });
+
+  const browser = await launchBrowser();
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+
+    const cookies = loadCookies();
+    if (cookies.length > 0) await page.setCookie(...cookies);
+
+    await page.goto(groupUrl, { waitUntil: 'networkidle2' });
+    await sleep(4000);
+
+    const result = await page.evaluate(() => {
+      const found = [];
+      const checks = [
+        '[aria-label="Write something to the group…"]',
+        '[aria-label="Write something to the group..."]',
+        '[aria-label="Write something..."]',
+        '[aria-label="Create a public post…"]',
+        'div[contenteditable="true"]',
+        '[role="textbox"]',
+        '[data-testid="status-attachment-mentions-input"]'
+      ];
+      for (const sel of checks) {
+        if (document.querySelector(sel)) found.push(sel);
+      }
+
+      // Also grab all aria-labels on the page
+      const ariaLabels = [...document.querySelectorAll('[aria-label]')]
+        .map(el => el.getAttribute('aria-label'))
+        .filter(l => l && l.length < 60)
+        .filter((v, i, a) => a.indexOf(v) === i)
+        .slice(0, 30);
+
+      return { matchedSelectors: found, ariaLabels };
+    });
+
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    await browser.close();
+  }
+});
