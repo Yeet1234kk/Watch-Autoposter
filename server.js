@@ -303,7 +303,8 @@ async function runPoster() {
         if (!composerOpened) throw new Error('Could not open post composer');
         await sleep(2000);
 
-        await page.keyboard.type(session.caption, { delay: rand(30, 80) });
+        const typed = await typeCaption(page, session.caption);
+        if (!typed) throw new Error('Could not type caption into composer');
         await sleep(1500);
 
         if (session.imagePaths.length > 0) {
@@ -349,34 +350,90 @@ async function runPoster() {
 }
 
 async function openComposer(page) {
-  const selectors = [
-    '[aria-label="Write something to the group..."]',
-    '[aria-label="Write something..."]',
+  const clicked = await page.evaluate(() => {
+    const textMatches = [
+      /write something/i,
+      /what.s on your mind/i,
+      /create post/i,
+      /เขียนอะไร/i,
+      /คุณกำลังคิดอะไร/i,
+      /สร้างโพสต์/i
+    ];
+
+    const candidates = [...document.querySelectorAll('[role="button"], span, div')]
+      .filter(el => {
+        const rect = el.getBoundingClientRect();
+        const text = el.textContent || el.getAttribute('aria-label') || '';
+        return rect.width > 40 && rect.height > 10 && textMatches.some(rx => rx.test(text));
+      });
+
+    const target = candidates
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (br.width * br.height) - (ar.width * ar.height);
+      })[0];
+
+    if (target) {
+      target.click();
+      return (target.textContent || target.getAttribute('aria-label') || '').slice(0, 80);
+    }
+
+    return null;
+  });
+
+  if (clicked) {
+    console.log(`Opened composer with text: ${clicked}`);
+    await sleep(2500);
+    return true;
+  }
+
+  const ariaSelectors = [
     '[aria-label*="Write something"]',
     '[aria-label*="Create a public post"]',
-    '[role="textbox"]',
-    'div[contenteditable="true"]',
-    'div[data-lexical-editor="true"]'
+    '[aria-label*="เขียนอะไร"]',
+    '[aria-label*="สร้างโพสต์"]'
   ];
 
-  for (const selector of selectors) {
+  for (const selector of ariaSelectors) {
     try {
-      await page.waitForSelector(selector, { timeout: 5000 });
+      await page.waitForSelector(selector, { timeout: 4000 });
       await page.click(selector);
       console.log(`Opened composer with ${selector}`);
+      await sleep(2500);
       return true;
     } catch {}
   }
 
-  return page.evaluate(() => {
-    const buttons = [...document.querySelectorAll('[role="button"], div, span')];
-    const button = buttons.find(el => /write something|what.s on your mind|create post/i.test(el.textContent || ''));
-    if (button) {
-      button.click();
-      return true;
-    }
+  return false;
+}
+
+async function typeCaption(page, caption) {
+  const typedInDialog = await page.evaluate((text) => {
+    const dialog = document.querySelector('[role="dialog"]') || document;
+    const boxes = [...dialog.querySelectorAll('[role="textbox"], div[contenteditable="true"], div[data-lexical-editor="true"]')]
+      .filter(el => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 80 && rect.height > 10;
+      });
+
+    const box = boxes[boxes.length - 1];
+    if (!box) return false;
+
+    box.focus();
+    document.execCommand('insertText', false, text);
+    box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+    return true;
+  }, caption);
+
+  if (typedInDialog) return true;
+
+  try {
+    await page.keyboard.type(caption, { delay: rand(30, 80) });
+    return true;
+  } catch {
     return false;
-  });
+  }
 }
 
 async function uploadImages(page, imagePaths) {
@@ -403,12 +460,13 @@ async function clickPost(page) {
   const clickByText = async labels => page.evaluate((wantedLabels) => {
     const normalize = text => (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const wanted = wantedLabels.map(normalize);
-    const buttons = [...document.querySelectorAll('[role="button"], button, [aria-label]')];
+    const root = document.querySelector('[role="dialog"]') || document;
+    const buttons = [...root.querySelectorAll('[role="button"], button, [aria-label]')];
 
     for (const button of buttons) {
       const text = normalize(button.textContent || button.getAttribute('aria-label') || '');
       const disabled = button.disabled || button.getAttribute('aria-disabled') === 'true';
-      if (!disabled && wanted.includes(text)) {
+      if (!disabled && (wanted.includes(text) || wanted.some(label => text.includes(label)))) {
         button.click();
         return text;
       }
@@ -453,7 +511,7 @@ async function clickPost(page) {
   }
 
   const visibleButtons = await page.evaluate(() =>
-    [...document.querySelectorAll('[role="button"], button, [aria-label]')]
+    [...(document.querySelector('[role="dialog"]') || document).querySelectorAll('[role="button"], button, [aria-label]')]
       .map(el => ({
         text: (el.textContent || '').replace(/\s+/g, ' ').trim(),
         aria: el.getAttribute('aria-label'),
