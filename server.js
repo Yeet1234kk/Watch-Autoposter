@@ -13,11 +13,11 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ─── In-memory session store (Railway has persistent disk too) ───
+// ─── In-memory session store ───
 let currentSession = null;
 let posterRunning = false;
 
-// ─── Multer: store uploaded images in /tmp (Railway's writable dir) ───
+// ─── Multer: store uploaded images in /tmp ───
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = '/tmp/watch-images';
@@ -49,7 +49,7 @@ app.get('/status', (req, res) => {
   });
 });
 
-// ─── START: receive caption + images + groups, kick off background poster ───
+// ─── START ───
 app.post('/start', upload.array('images', 20), async (req, res) => {
   try {
     if (posterRunning) return res.status(409).json({ error: 'Already running. Stop first.' });
@@ -70,10 +70,8 @@ app.post('/start', upload.array('images', 20), async (req, res) => {
       startedAt: new Date().toISOString()
     };
 
-    // Respond immediately, then start posting in background
     res.json({ ok: true, sessionId: currentSession.id, groups: parsedGroups.length, images: imagePaths.length });
 
-    // Kick off background posting (don't await — runs independently)
     runPoster().catch(err => {
       console.error('Poster error:', err);
       posterRunning = false;
@@ -91,18 +89,28 @@ app.post('/stop', (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── BACKGROUND POSTER ───
+// ─── HELPERS ───
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
-async function runPoster() {
+function loadCookies() {
+  const cookiePath = '/tmp/fb-cookies.json';
+  if (!fs.existsSync(cookiePath)) return [];
+  const raw = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
+  return raw.map(c => ({
+    name: c.name,
+    value: c.value,
+    domain: c.domain || '.facebook.com',
+    path: c.path || '/',
+    httpOnly: c.httpOnly || false,
+    secure: c.secure || false,
+    sameSite: 'None'
+  }));
+}
+
+function launchBrowser() {
   const puppeteer = require('puppeteer');
-  posterRunning = true;
-  const session = currentSession;
-
-  console.log(`\n🚀 Auto-poster started: ${session.groups.length} groups`);
-
-  const browser = await puppeteer.launch({
+  return puppeteer.launch({
     headless: 'new',
     args: [
       '--no-sandbox',
@@ -112,151 +120,84 @@ async function runPoster() {
       '--single-process'
     ]
   });
-
-  try {
-    const page = await browser.newPage();
-    page.setDefaultTimeout(30000);
-    await page.setViewport({ width: 1280, height: 800 });
-
-    // ── Log into Facebook using saved cookies ──
-    const cookiePath = '/tmp/fb-cookies.json';
-   if (fs.existsSync(cookiePath)) {
-  const raw = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
-  const cookies = raw.map(c => ({
-    name: c.name,
-    value: c.value,
-    domain: c.domain || '.facebook.com',
-    path: c.path || '/',
-    httpOnly: c.httpOnly || false,
-    secure: c.secure || false,
-    sameSite: 'None'
-  }));
-  await page.setCookie(...cookies);
-  console.log(`🍪 ${cookies.length} cookies loaded`);
 }
 
-    await page.goto('https://www.facebook.com', { waitUntil: 'networkidle2' });
-    await sleep(3000);
-
-    // Check if logged in
-    const isLoggedIn = await page.evaluate(() =>
-      !document.querySelector('[data-testid="royal_login_form"]') &&
-      !document.querySelector('#loginform')
-    );
-
-    if (!isLoggedIn) {
-      console.error('❌ Not logged into Facebook. Use /login endpoint first.');
-      session.groups.forEach(g => g.postStatus = 'failed');
-      session.error = 'Not logged into Facebook. Set up cookies first via /login.';
-      posterRunning = false;
-      await browser.close();
-      return;
-    }
-
-    console.log('✅ Logged into Facebook');
-
-    // ── Post to each group ──
-    const pending = session.groups.filter(g => g.postStatus === 'pending' && g.link);
-
-    for (let i = 0; i < pending.length; i++) {
-      if (session.stopped) { console.log('⛔ Stopped by user'); break; }
-
-      const group = pending[i];
-      console.log(`\n[${i+1}/${pending.length}] → ${group.name}`);
-
-      try {
-        await page.goto(group.link, { waitUntil: 'networkidle2', timeout: 30000 });
-        await sleep(4000 + rand(0, 2000));
-
-        // Click composer
-        const composerOpened = await openComposer(page);
-        if (!composerOpened) throw new Error('Could not open post composer');
-        await sleep(2000);
-
-        // Type caption with human-like delays
-        await page.keyboard.type(session.caption, { delay: rand(30, 80) });
-        await sleep(1500);
-
-        // Upload images
-        if (session.imagePaths.length > 0) {
-          await uploadImages(page, session.imagePaths);
-          await sleep(4000);
-        }
-
-        // Click Post
-        const posted = await clickPost(page);
-        if (!posted) throw new Error('Could not click Post button');
-
-        await sleep(4000);
-        group.postStatus = 'done';
-        session.progress.done++;
-        console.log(`  ✅ Posted!`);
-
-        // Save cookies after successful post
-        const cookies = await page.cookies();
-        fs.writeFileSync(cookiePath, JSON.stringify(cookies));
-
-        // Wait between groups
-        if (i < pending.length - 1) {
-          const wait = 1 * 60 * 1000 + rand(0, 60000); // 4-5 min random
-          console.log(`  ⏳ Waiting ${Math.round(wait/60000)} min...`);
-          await sleep(wait);
-        }
-
-      } catch (err) {
-        console.error(`  ❌ Failed: ${err.message}`);
-        group.postStatus = 'failed';
-        await sleep(3000);
-      }
-    }
-
-  } finally {
-    await browser.close();
-    posterRunning = false;
-    console.log('\n🎉 Posting session complete!');
-  }
-}
-
-// ─── HELPERS ───
 async function openComposer(page) {
+  await sleep(3000);
+
   const selectors = [
+    '[aria-label="Write something to the group…"]',
+    '[aria-label="Write something to the group..."]',
     '[aria-label="Write something..."]',
     '[aria-label="Create a public post…"]',
+    '[aria-label="Create a public post..."]',
+    '[aria-label="What\'s on your mind?"]',
     '[data-testid="status-attachment-mentions-input"]',
+    'div[contenteditable="true"]',
     '[role="textbox"]'
   ];
+
   for (const sel of selectors) {
     try {
-      await page.waitForSelector(sel, { timeout: 4000 });
-      await page.click(sel);
-      return true;
+      const el = await page.waitForSelector(sel, { timeout: 5000 });
+      if (el) {
+        await el.evaluate(e => e.scrollIntoView());
+        await sleep(500);
+        await el.click();
+        await sleep(1000);
+        console.log(`  🖊 Composer opened via: ${sel}`);
+        return true;
+      }
     } catch {}
   }
-  // Fallback: find by text
-  return page.evaluate(() => {
-    for (const el of document.querySelectorAll('[role="button"]')) {
-      if (/write something|what.s on your mind/i.test(el.textContent)) {
-        el.click(); return true;
+
+  // Fallback: find by placeholder text or button text
+  const found = await page.evaluate(() => {
+    const patterns = [
+      /write something/i,
+      /what.s on your mind/i,
+      /create a post/i,
+      /เขียนอะไรบางอย่าง/i,
+    ];
+    const candidates = [
+      ...document.querySelectorAll('[role="button"]'),
+      ...document.querySelectorAll('div[tabindex]'),
+      ...document.querySelectorAll('[placeholder]')
+    ];
+    for (const el of candidates) {
+      const text = el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.textContent || '';
+      if (patterns.some(p => p.test(text))) {
+        el.click();
+        return true;
       }
     }
     return false;
   });
+
+  if (found) {
+    await sleep(2000);
+    console.log('  🖊 Composer opened via fallback');
+    return true;
+  }
+
+  // Save debug screenshot
+  await page.screenshot({ path: '/tmp/composer-debug.png' });
+  console.log('  📸 Debug screenshot saved: /tmp/composer-debug.png');
+  return false;
 }
 
 async function uploadImages(page, imagePaths) {
   const validPaths = imagePaths.filter(p => fs.existsSync(p));
   if (!validPaths.length) return;
 
-  // Try direct file input
   let input = await page.$('input[type="file"][accept*="image"]');
   if (!input) {
-    // Click photo button first
     await page.evaluate(() => {
       for (const b of document.querySelectorAll('[role="button"]')) {
         if (/photo|video/i.test(b.textContent)) { b.click(); return; }
       }
     });
-    await new Promise(r => setTimeout(r, 2000));
+    await sleep(2000);
     input = await page.$('input[type="file"]');
   }
   if (input) {
@@ -283,8 +224,112 @@ async function clickPost(page) {
   });
 }
 
-// ─── COOKIE LOGIN SETUP ───
-// POST /save-cookies with { cookies: [...] } to save your FB session
+// ─── BACKGROUND POSTER ───
+async function runPoster() {
+  posterRunning = true;
+  const session = currentSession;
+  console.log(`\n🚀 Auto-poster started: ${session.groups.length} groups`);
+
+  const browser = await launchBrowser();
+
+  try {
+    const page = await browser.newPage();
+    page.setDefaultTimeout(30000);
+    await page.setViewport({ width: 1280, height: 800 });
+
+    const cookies = loadCookies();
+    if (cookies.length > 0) {
+      await page.setCookie(...cookies);
+      console.log(`🍪 ${cookies.length} cookies loaded`);
+    } else {
+      console.error('❌ No cookies found at /tmp/fb-cookies.json');
+    }
+
+    await page.goto('https://www.facebook.com', { waitUntil: 'networkidle2' });
+    await sleep(3000);
+
+    const pageTitle = await page.title();
+    const pageUrl = page.url();
+    console.log(`📄 ${pageTitle} | ${pageUrl}`);
+
+    const isLoggedIn = await page.evaluate(() =>
+      !document.querySelector('[data-testid="royal_login_form"]') &&
+      !document.querySelector('#loginform')
+    );
+
+    if (!isLoggedIn) {
+      console.error('❌ Not logged into Facebook — cookies not working');
+      session.groups.forEach(g => g.postStatus = 'failed');
+      session.error = 'Not logged into Facebook. Re-send cookies via /save-cookies.';
+      posterRunning = false;
+      await browser.close();
+      return;
+    }
+
+    console.log('✅ Logged into Facebook');
+
+    const pending = session.groups.filter(g => g.postStatus === 'pending' && g.link);
+
+    for (let i = 0; i < pending.length; i++) {
+      if (session.stopped) { console.log('⛔ Stopped by user'); break; }
+
+      const group = pending[i];
+      console.log(`\n[${i+1}/${pending.length}] → ${group.name}`);
+
+      try {
+        await page.goto(group.link, { waitUntil: 'networkidle2', timeout: 30000 });
+        await sleep(4000 + rand(0, 2000));
+
+        // Log page after navigation
+        const gTitle = await page.title();
+        const gUrl = page.url();
+        console.log(`  📄 ${gTitle} | ${gUrl}`);
+
+        const composerOpened = await openComposer(page);
+        if (!composerOpened) throw new Error('Could not open post composer');
+        await sleep(2000);
+
+        await page.keyboard.type(session.caption, { delay: rand(30, 80) });
+        await sleep(1500);
+
+        if (session.imagePaths.length > 0) {
+          await uploadImages(page, session.imagePaths);
+          await sleep(4000);
+        }
+
+        const posted = await clickPost(page);
+        if (!posted) throw new Error('Could not click Post button');
+
+        await sleep(4000);
+        group.postStatus = 'done';
+        session.progress.done++;
+        console.log(`  ✅ Posted!`);
+
+        // Refresh cookies after successful post
+        const updatedCookies = await page.cookies();
+        fs.writeFileSync('/tmp/fb-cookies.json', JSON.stringify(updatedCookies));
+
+        if (i < pending.length - 1) {
+          const wait = 1 * 60 * 1000 + rand(0, 60000);
+          console.log(`  ⏳ Waiting ${Math.round(wait/60000)} min...`);
+          await sleep(wait);
+        }
+
+      } catch (err) {
+        console.error(`  ❌ Failed: ${err.message}`);
+        group.postStatus = 'failed';
+        await sleep(3000);
+      }
+    }
+
+  } finally {
+    await browser.close();
+    posterRunning = false;
+    console.log('\n🎉 Posting session complete!');
+  }
+}
+
+// ─── SAVE COOKIES ───
 app.post('/save-cookies', (req, res) => {
   const { cookies, secret } = req.body;
   if (secret !== process.env.SECRET_KEY) return res.status(403).json({ error: 'Forbidden' });
@@ -292,35 +337,18 @@ app.post('/save-cookies', (req, res) => {
   res.json({ ok: true, count: cookies.length });
 });
 
-app.listen(PORT, () => {
-  console.log(`\n🟢 Watch Auto-Poster running on port ${PORT}`);
-  console.log(`   Set SECRET_KEY env var to protect your /save-cookies endpoint\n`);
-});
 // ─── DEBUG: Check login status ───
 app.get('/check-login', async (req, res) => {
-  const puppeteer = require('puppeteer');
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
-  });
+  const browser = await launchBrowser();
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    const cookiePath = '/tmp/fb-cookies.json';
-    if (fs.existsSync(cookiePath)) {
-      const raw = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
-      const cookies = raw.map(c => ({
-        name: c.name, value: c.value,
-        domain: c.domain || '.facebook.com',
-        path: c.path || '/', httpOnly: c.httpOnly || false,
-        secure: c.secure || false, sameSite: 'None'
-      }));
-      await page.setCookie(...cookies);
-    }
+    const cookies = loadCookies();
+    if (cookies.length > 0) await page.setCookie(...cookies);
 
     await page.goto('https://www.facebook.com', { waitUntil: 'networkidle2' });
-    await new Promise(r => setTimeout(r, 3000));
+    await sleep(3000);
 
     const result = await page.evaluate(() => ({
       url: location.href,
@@ -331,9 +359,14 @@ app.get('/check-login', async (req, res) => {
     }));
 
     res.json(result);
-  } catch(e) {
+  } catch (e) {
     res.status(500).json({ error: e.message });
   } finally {
     await browser.close();
   }
+});
+
+app.listen(PORT, () => {
+  console.log(`\n🟢 Watch Auto-Poster running on port ${PORT}`);
+  console.log(`   Set SECRET_KEY env var to protect your /save-cookies endpoint\n`);
 });
