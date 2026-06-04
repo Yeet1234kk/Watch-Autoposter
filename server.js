@@ -1,7 +1,8 @@
 /**
  * Watch Auto-Poster - Railway Server
  * 
- * Uses persistent Chrome profile to maintain Facebook login across sessions.
+ * Simplified approach: Use persistent profile to maintain browser state.
+ * Don't rely on exported cookies — let the profile handle authentication naturally.
  */
 
 const express = require('express');
@@ -38,7 +39,14 @@ app.use(express.json({ limit: '50mb' }));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
-// ─── COOKIE HANDLING ───
+// ─── SETUP ───
+function ensureProfileDir() {
+  if (!fs.existsSync(PROFILE_DIR)) {
+    fs.mkdirSync(PROFILE_DIR, { recursive: true });
+    console.log(`📁 Created Chrome profile directory: ${PROFILE_DIR}`);
+  }
+}
+
 function saveCookies(cookies) {
   const cleaned = (cookies || [])
     .filter(c => c && c.name && c.value)
@@ -54,21 +62,18 @@ function saveCookies(cookies) {
     }));
 
   fs.writeFileSync(COOKIE_PATH, JSON.stringify(cleaned, null, 2));
-  console.log(`💾 Saved ${cleaned.length} cookies to disk`);
+  console.log(`💾 Saved ${cleaned.length} cookies`);
   return cleaned;
 }
 
 function loadCookies() {
   if (!fs.existsSync(COOKIE_PATH)) {
-    console.log('⚠️ No cookies file found at', COOKIE_PATH);
     return [];
   }
 
   try {
     const raw = JSON.parse(fs.readFileSync(COOKIE_PATH, 'utf8'));
-    const cookies = Array.isArray(raw) ? raw : [];
-    console.log(`📖 Loaded ${cookies.length} cookies from disk`);
-    return cookies;
+    return Array.isArray(raw) ? raw : [];
   } catch (err) {
     console.error('❌ Failed to parse cookies:', err.message);
     return [];
@@ -77,24 +82,18 @@ function loadCookies() {
 
 async function launchBrowser() {
   const puppeteer = require('puppeteer');
-  
-  // Ensure profile directory exists
-  if (!fs.existsSync(PROFILE_DIR)) {
-    fs.mkdirSync(PROFILE_DIR, { recursive: true });
-    console.log(`📁 Created Chrome profile directory: ${PROFILE_DIR}`);
-  }
+  ensureProfileDir();
 
-  console.log(`🌐 Launching Chrome with persistent profile: ${PROFILE_DIR}`);
+  console.log(`🌐 Launching Chrome with profile: ${PROFILE_DIR}`);
   
   return puppeteer.launch({
     headless: 'new',
-    userDataDir: PROFILE_DIR,  // ← KEY: Use persistent profile
+    userDataDir: PROFILE_DIR,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-blink-features=AutomationControlled'
+      '--disable-gpu'
     ]
   });
 }
@@ -129,66 +128,59 @@ app.post('/save-cookies', (req, res) => {
 
   const saved = saveCookies(cookies);
   const names = saved.map(c => c.name);
-  const hasCritical = names.includes('c_user') && (names.includes('xs') || names.includes('datr'));
 
   res.json({
     ok: true,
     count: saved.length,
     savedCookieNames: names,
-    hasCritical: hasCritical,
-    message: hasCritical ? '✅ Cookies saved! Profile will import them on first posting session.' : '⚠️ Missing critical cookies'
+    message: '✅ Cookies stored. They will be imported into the Chrome profile on first use.'
   });
 });
 
 app.get('/check-login', async (req, res) => {
-  console.log('\n📋 /check-login: Testing Facebook access with persistent profile...');
+  console.log('\n📋 /check-login: Testing Chrome profile...');
   const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Load saved cookies and apply them
+    // Try to import saved cookies into the profile
     const cookies = loadCookies();
     if (cookies.length > 0) {
-      console.log(`📋 Applying ${cookies.length} saved cookies to persistent profile`);
+      console.log(`📋 Importing ${cookies.length} cookies into profile`);
       try {
         await page.setCookie(...cookies);
       } catch (err) {
-        console.warn('⚠️ Some cookies could not be set:', err.message);
+        console.warn('⚠️ Could not set all cookies:', err.message);
       }
     }
 
-    console.log('📋 Navigating to facebook.com...');
+    console.log('📋 Loading facebook.com...');
     await page.goto('https://www.facebook.com/', { waitUntil: 'networkidle2' });
-    await sleep(4000);
+    await sleep(3000);
 
-    const result = await page.evaluate(() => {
-      const cookies = document.cookie.split(';').map(c => c.trim().split('=')[0]).filter(Boolean);
-      return {
-        url: location.href,
-        title: document.title,
-        hasLoginForm: !!document.querySelector('#loginform') || !!document.querySelector('[data-testid="royal_login_form"]'),
-        hasProfileLink: !!document.querySelector('[aria-label="Your profile"]'),
-        browserCookieNames: cookies
-      };
-    });
+    // Get all cookies that are now in the browser (including profile defaults + imported)
+    const allCookies = await page.cookies();
+    const browserCookieNames = allCookies.map(c => c.name);
 
-    const browserNames = result.browserCookieNames;
-    const hasCritical = browserNames.includes('c_user') && (browserNames.includes('xs') || browserNames.includes('datr'));
+    const result = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      hasLoginForm: !!document.querySelector('#loginform') || !!document.querySelector('[data-testid="royal_login_form"]'),
+      hasProfileLink: !!document.querySelector('[aria-label="Your profile"]')
+    }));
 
     res.json({
       ...result,
       savedCookieNames: cookies.map(c => c.name),
-      browserCookieNames: browserNames,
-      hasCritical: hasCritical,
-      readyToPost: !result.hasLoginForm && hasCritical,
-      status: !result.hasLoginForm ? '✅ Logged in' : '❌ Not logged in',
-      note: 'Profile will persist login across sessions'
+      browserCookieNames: browserCookieNames,
+      readyToPost: !result.hasLoginForm,
+      status: !result.hasLoginForm ? '✅ Logged in' : '❌ Not logged in'
     });
 
   } catch (err) {
-    console.error('❌ /check-login error:', err);
+    console.error('❌ Error:', err.message);
     res.status(500).json({ error: err.message });
   } finally {
     await browser.close();
@@ -244,7 +236,7 @@ app.post('/stop', (req, res) => {
 async function runPoster() {
   posterRunning = true;
   const session = currentSession;
-  console.log(`\n🎬 Starting posting session: ${session.groups.length} groups`);
+  console.log(`\n🎬 Posting session: ${session.groups.length} groups`);
 
   const browser = await launchBrowser();
 
@@ -253,117 +245,90 @@ async function runPoster() {
     page.setDefaultTimeout(30000);
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Load and apply cookies to the persistent profile
+    // Import cookies into profile
     const cookies = loadCookies();
     if (cookies.length > 0) {
-      console.log(`🍪 Applying ${cookies.length} cookies to persistent profile`);
+      console.log(`🍪 Importing ${cookies.length} cookies`);
       try {
         await page.setCookie(...cookies);
       } catch (err) {
-        console.warn('⚠️ Some cookies failed to set:', err.message);
+        console.warn('⚠️ Some cookies failed:', err.message);
       }
     }
 
-    // Navigate to Facebook
     console.log('📄 Loading facebook.com...');
     await page.goto('https://www.facebook.com/', { waitUntil: 'networkidle2' });
-    await sleep(5000);
+    await sleep(4000);
 
-    // Check if logged in
     const pageTitle = await page.title();
-    const pageUrl = page.url();
     console.log(`   Title: ${pageTitle}`);
-    console.log(`   URL: ${pageUrl}`);
 
+    // Check for login page
     const isLoginPage = await page.evaluate(() =>
       !!document.querySelector('#loginform') ||
-      !!document.querySelector('[data-testid="royal_login_form"]') ||
-      /log in/i.test(document.body.innerText.slice(0, 300))
+      !!document.querySelector('[data-testid="royal_login_form"]')
     );
 
     if (isLoginPage) {
-      throw new Error('Facebook login page detected. Cookies may be expired.');
+      throw new Error('Detected login page. Not authenticated.');
     }
 
-    console.log('✅ Logged into Facebook');
+    console.log('✅ Authenticated');
 
-    // Proceed with posting
     const pending = session.groups.filter(g => g.postStatus === 'pending' && g.link);
 
     for (let i = 0; i < pending.length; i++) {
-      if (session.stopped) {
-        console.log('⛔ Stopped by user');
-        break;
-      }
+      if (session.stopped) break;
 
       const group = pending[i];
       console.log(`\n[${i + 1}/${pending.length}] → ${group.name}`);
 
       try {
         await page.goto(group.link, { waitUntil: 'networkidle2', timeout: 30000 });
-        await sleep(5000 + rand(0, 2000));
+        await sleep(4000 + rand(0, 2000));
 
-        const gTitle = await page.title();
-        console.log(`   Loaded: ${gTitle}`);
-
-        // Try to open composer
         const composerOpened = await openComposer(page);
-        if (!composerOpened) {
-          throw new Error('Could not open post composer');
-        }
-        await sleep(2000);
-
-        // Type caption
-        await page.keyboard.type(session.caption, { delay: rand(30, 80) });
+        if (!composerOpened) throw new Error('Composer not found');
         await sleep(1500);
 
-        // Upload images
+        await page.keyboard.type(session.caption, { delay: rand(30, 80) });
+        await sleep(1000);
+
         if (session.imagePaths.length > 0) {
           await uploadImages(page, session.imagePaths);
-          await sleep(4000);
+          await sleep(3000);
         }
 
-        // Click post
         const posted = await clickPost(page);
-        if (!posted) {
-          throw new Error('Could not click Post button');
-        }
+        if (!posted) throw new Error('Post button not found');
 
-        await sleep(4000);
+        await sleep(3000);
         group.postStatus = 'done';
         session.progress.done++;
-        console.log(`   ✅ Posted!`);
+        console.log(`   ✅ Posted`);
 
-        // Refresh cookies from persistent profile
-        const updatedCookies = await page.cookies();
-        saveCookies(updatedCookies);
-
-        // Wait before next group
         if (i < pending.length - 1) {
-          const waitMs = 60 * 1000 + rand(0, 60000);
-          console.log(`   ⏳ Waiting ${Math.round(waitMs / 60000)} min...`);
-          await sleep(waitMs);
+          const wait = 60 * 1000 + rand(0, 30000);
+          console.log(`   ⏳ Waiting ${Math.round(wait/60000)} min`);
+          await sleep(wait);
         }
 
       } catch (err) {
-        console.error(`   ❌ Failed: ${err.message}`);
+        console.error(`   ❌ ${err.message}`);
         group.postStatus = 'failed';
-        await sleep(3000);
+        await sleep(2000);
       }
     }
 
   } catch (err) {
-    console.error(`💥 Session error: ${err.message}`);
-    if (session) {
-      session.error = err.message;
-      session.groups.forEach(g => {
-        if (g.postStatus === 'pending') g.postStatus = 'failed';
-      });
-    }
+    console.error(`💥 ${err.message}`);
+    session.groups.forEach(g => {
+      if (g.postStatus === 'pending') g.postStatus = 'failed';
+    });
   } finally {
     await browser.close();
     posterRunning = false;
-    console.log('\n🎉 Session complete!\n');
+    console.log('\n🎉 Complete\n');
   }
 }
 
@@ -371,21 +336,17 @@ async function openComposer(page) {
   const selectors = [
     '[aria-label="Write something to the group..."]',
     '[aria-label="Write something..."]',
-    '[aria-label="Create a public post…"]',
-    '[data-testid="status-attachment-mentions-input"]',
-    'div[contenteditable="true"]',
-    '[role="textbox"]'
+    '[data-testid="status-attachment-mentions-input"]'
   ];
 
   for (const sel of selectors) {
     try {
-      await page.waitForSelector(sel, { timeout: 3000 });
+      await page.waitForSelector(sel, { timeout: 2000 });
       await page.click(sel);
-      console.log(`   Opened composer with: ${sel}`);
+      console.log(`   Composer: ${sel}`);
       return true;
     } catch {}
   }
-
   return false;
 }
 
@@ -393,38 +354,30 @@ async function uploadImages(page, imagePaths) {
   const valid = imagePaths.filter(p => fs.existsSync(p));
   if (!valid.length) return;
 
-  let input = await page.$('input[type="file"][accept*="image"]');
-  if (!input) {
-    input = await page.$('input[type="file"]');
-  }
-
+  let input = await page.$('input[type="file"]');
   if (input) {
     await input.uploadFile(...valid);
-    console.log(`   ${valid.length} image(s) uploaded`);
+    console.log(`   Uploaded ${valid.length} image(s)`);
   }
 }
 
 async function clickPost(page) {
   const buttons = [
     '[aria-label="Post"]',
-    '[data-testid="react-composer-post-button"]'
+    'button[aria-label*="Post"]'
   ];
 
   for (const sel of buttons) {
-    try {
-      const btn = await page.$(sel);
-      if (btn) {
-        await btn.click();
-        console.log(`   Clicked Post button`);
-        return true;
-      }
-    } catch {}
+    const btn = await page.$(sel);
+    if (btn) {
+      await btn.click();
+      return true;
+    }
   }
-
   return false;
 }
 
+ensureProfileDir();
 app.listen(PORT, () => {
-  console.log(`✅ Watch Auto-Poster running on port ${PORT}`);
-  console.log(`   Using persistent Chrome profile: ${PROFILE_DIR}\n`);
+  console.log(`✅ Watch Auto-Poster ready on port ${PORT}\n`);
 });
