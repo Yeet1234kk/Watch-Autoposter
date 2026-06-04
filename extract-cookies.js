@@ -9,13 +9,12 @@
  *   3. Log into Facebook in the Chrome window that opens
  *   4. Press Enter in terminal when done
  */
-
 const puppeteer = require('puppeteer');
 const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 const readline = require('readline');
 
-const RAILWAY_URL = process.env.RAILWAY_URL || 'YOUR_RAILWAY_URL_HERE';
-const SECRET_KEY  = process.env.SECRET_KEY  || 'YOUR_SECRET_KEY_HERE';
+const RAILWAY_URL = 'https://watch-autoposter-production.up.railway.app';
+const SECRET_KEY  = 'mywatch2024';
 
 async function main() {
   console.log('\n🍪 Facebook Cookie Extractor');
@@ -30,6 +29,7 @@ async function main() {
 
   const page = await browser.newPage();
   await page.goto('https://www.facebook.com', { waitUntil: 'networkidle2' });
+  await new Promise(r => setTimeout(r, 5000));
 
   // Wait for user to log in
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
