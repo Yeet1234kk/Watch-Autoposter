@@ -189,7 +189,7 @@ async function runPoster() {
 
         // Wait between groups
         if (i < pending.length - 1) {
-          const wait = 4 * 60 * 1000 + rand(0, 60000); // 4-5 min random
+          const wait = 1 * 60 * 1000 + rand(0, 60000); // 4-5 min random
           console.log(`  ⏳ Waiting ${Math.round(wait/60000)} min...`);
           await sleep(wait);
         }
