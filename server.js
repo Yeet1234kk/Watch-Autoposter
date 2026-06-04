@@ -352,19 +352,27 @@ async function runPoster() {
 async function openComposer(page) {
   const clicked = await page.evaluate(() => {
     const textMatches = [
-      /write something/i,
-      /what.s on your mind/i,
-      /create post/i,
-      /เขียนอะไร/i,
-      /คุณกำลังคิดอะไร/i,
-      /สร้างโพสต์/i
+      /^(write something|write something\.\.\.)$/i,
+      /^what.s on your mind/i,
+      /^create post$/i,
+      /^เขียนอะไร/i,
+      /^คุณคิดอะไรอยู่/i,
+      /^คุณกำลังคิดอะไร/i,
+      /^สร้างโพสต์$/
     ];
 
-    const candidates = [...document.querySelectorAll('[role="button"], span, div')]
+    const candidates = [...document.querySelectorAll('[role="button"], button, [aria-label]')]
       .filter(el => {
         const rect = el.getBoundingClientRect();
         const text = el.textContent || el.getAttribute('aria-label') || '';
-        return rect.width > 40 && rect.height > 10 && textMatches.some(rx => rx.test(text));
+        const cleanText = text.replace(/\s+/g, ' ').trim();
+        return (
+          rect.width > 40 &&
+          rect.height > 10 &&
+          cleanText.length > 0 &&
+          cleanText.length < 180 &&
+          textMatches.some(rx => rx.test(cleanText))
+        );
       });
 
     const target = candidates
@@ -384,6 +392,30 @@ async function openComposer(page) {
 
   if (clicked) {
     console.log(`Opened composer with text: ${clicked}`);
+    await sleep(2500);
+    const hasDialogTextbox = await page.evaluate(() =>
+      Boolean((document.querySelector('[role="dialog"]') || document).querySelector('[role="textbox"], div[contenteditable="true"], div[data-lexical-editor="true"]'))
+    );
+    if (hasDialogTextbox) return true;
+    console.log('Composer click did not open a dialog textbox');
+  }
+
+  const textboxClicked = await page.evaluate(() => {
+    const boxes = [...document.querySelectorAll('[role="textbox"], div[contenteditable="true"], div[data-lexical-editor="true"]')]
+      .filter(el => {
+        const rect = el.getBoundingClientRect();
+        const text = (el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        return rect.width > 160 && rect.height > 20 && text.length < 180;
+      });
+
+    const box = boxes[0];
+    if (!box) return null;
+    box.click();
+    return (box.textContent || box.getAttribute('aria-label') || '').slice(0, 80);
+  });
+
+  if (textboxClicked !== null) {
+    console.log(`Opened composer with textbox: ${textboxClicked}`);
     await sleep(2500);
     return true;
   }
@@ -440,15 +472,16 @@ async function uploadImages(page, imagePaths) {
   const validPaths = imagePaths.filter(filePath => fs.existsSync(filePath));
   if (!validPaths.length) return;
 
-  let input = await page.$('input[type="file"][accept*="image"]');
+  let input = await page.$('[role="dialog"] input[type="file"], input[type="file"][accept*="image"]');
   if (!input) {
     await page.evaluate(() => {
-      const button = [...document.querySelectorAll('[role="button"], div, span')]
-        .find(el => /photo|video/i.test(el.textContent || ''));
+      const root = document.querySelector('[role="dialog"]') || document;
+      const button = [...root.querySelectorAll('[role="button"], button, [aria-label], div, span')]
+        .find(el => /photo|video|รูปภาพ|วิดีโอ/i.test(el.textContent || el.getAttribute('aria-label') || ''));
       if (button) button.click();
     });
     await sleep(2000);
-    input = await page.$('input[type="file"]');
+    input = await page.$('[role="dialog"] input[type="file"], input[type="file"]');
   }
 
   if (!input) throw new Error('Could not find image upload input');
