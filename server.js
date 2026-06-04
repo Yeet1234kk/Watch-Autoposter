@@ -120,11 +120,20 @@ async function runPoster() {
 
     // ── Log into Facebook using saved cookies ──
     const cookiePath = '/tmp/fb-cookies.json';
-    if (fs.existsSync(cookiePath)) {
-      const cookies = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
-      await page.setCookie(...cookies);
-      console.log('🍪 Cookies loaded');
-    }
+   if (fs.existsSync(cookiePath)) {
+  const raw = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
+  const cookies = raw.map(c => ({
+    name: c.name,
+    value: c.value,
+    domain: c.domain || '.facebook.com',
+    path: c.path || '/',
+    httpOnly: c.httpOnly || false,
+    secure: c.secure || false,
+    sameSite: 'None'
+  }));
+  await page.setCookie(...cookies);
+  console.log(`🍪 ${cookies.length} cookies loaded`);
+}
 
     await page.goto('https://www.facebook.com', { waitUntil: 'networkidle2' });
     await sleep(3000);
