@@ -425,43 +425,91 @@ async function uploadImages(page, imagePaths) {
 async function clickPost(page) {
   console.log('   Looking for Post button...');
 
+  // Wait a moment for the Post button to become available
+  await sleep(2000);
+
+  // Log all visible buttons for debugging
+  const allButtons = await page.evaluate(() => {
+    return Array.from(document.querySelectorAll('button, [role="button"]'))
+      .slice(0, 50)  // Limit to first 50
+      .map(btn => ({
+        text: btn.textContent.trim().slice(0, 30),
+        aria: btn.getAttribute('aria-label'),
+        disabled: btn.disabled || btn.getAttribute('aria-disabled') === 'true'
+      }));
+  });
+
+  console.log(`   Found ${allButtons.length} buttons:`);
+  allButtons.slice(0, 10).forEach(b => {
+    console.log(`     - "${b.text}" | aria: "${b.aria}" | disabled: ${b.disabled}`);
+  });
+
+  // Try specific selectors first
   const selectors = [
     '[aria-label="Post"]',
-    'button[aria-label="Post"]',
-    'div[role="button"][aria-label="Post"]',
-    'button:has-text("Post")',
-    'button:has-text("โพสต์")'
+    'button[aria-label*="Post"]',
+    'button:contains("Post")',
+    'button:contains("โพสต์")'
   ];
 
   for (const sel of selectors) {
     try {
       const btn = await page.$(sel);
       if (btn) {
-        await btn.click();
-        console.log(`   ✓ Clicked: ${sel}`);
-        return true;
+        const disabled = await page.evaluate(el => el.disabled, btn);
+        if (!disabled) {
+          await btn.click();
+          console.log(`   ✓ Clicked: ${sel}`);
+          return true;
+        }
       }
     } catch {}
   }
 
-  // Fallback: Find button by text content
+  // Smarter fallback: Find any button that looks like a Post button
   try {
     const found = await page.evaluate(() => {
       const buttons = document.querySelectorAll('button, [role="button"]');
+      
+      // First, try exact text matches
       for (const btn of buttons) {
-        if (btn.textContent.trim() === 'Post' || btn.textContent.trim() === 'โพสต์') {
+        const text = btn.textContent.trim().toLowerCase();
+        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+        
+        if (text === 'post' || aria === 'post' || 
+            text === 'โพสต์' || aria === 'โพสต์' ||
+            text === 'list' || aria === 'list' ||
+            text === 'ลงประกาศ' || aria === 'ลงประกาศ') {
+          
+          const disabled = btn.disabled || btn.getAttribute('aria-disabled') === 'true';
+          if (!disabled) {
+            btn.click();
+            return true;
+          }
+        }
+      }
+      
+      // Second, try partial matches on enabled buttons
+      for (const btn of buttons) {
+        const text = btn.textContent.trim().toLowerCase();
+        const disabled = btn.disabled || btn.getAttribute('aria-disabled') === 'true';
+        
+        if (!disabled && (text.includes('post') || text.includes('โพสต์') || text.includes('ลง'))) {
           btn.click();
           return true;
         }
       }
+      
       return false;
     });
 
     if (found) {
-      console.log(`   ✓ Clicked Post button by text`);
+      console.log(`   ✓ Clicked Post button`);
       return true;
     }
-  } catch {}
+  } catch (err) {
+    console.log(`   ⚠️ Error finding Post button: ${err.message}`);
+  }
 
   return false;
 }
