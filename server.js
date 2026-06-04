@@ -222,6 +222,12 @@ app.post('/start', upload.array('images', 20), async (req, res) => {
     if (!caption) return res.status(400).json({ error: 'Caption required' });
 
     const parsedGroups = JSON.parse(groups);
+    if (!Array.isArray(parsedGroups) || parsedGroups.length !== 1) {
+      return res.status(400).json({
+        error: `Safety lock: select exactly 1 group. Received ${Array.isArray(parsedGroups) ? parsedGroups.length : 0}.`
+      });
+    }
+
     const imagePaths = (req.files || []).map(file => file.path);
 
     currentSession = {
@@ -350,6 +356,19 @@ async function runPoster() {
 }
 
 async function openComposer(page) {
+  async function waitForComposerDialog() {
+    try {
+      await page.waitForFunction(() => {
+        const dialog = document.querySelector('[role="dialog"]');
+        if (!dialog) return false;
+        return Boolean(dialog.querySelector('[role="textbox"], div[contenteditable="true"], div[data-lexical-editor="true"]'));
+      }, { timeout: 5000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   const clicked = await page.evaluate(() => {
     const textMatches = [
       /^(write something|write something\.\.\.)$/i,
@@ -383,7 +402,8 @@ async function openComposer(page) {
       })[0];
 
     if (target) {
-      target.click();
+      const clickable = target.closest('[role="button"], button') || target;
+      clickable.click();
       return (target.textContent || target.getAttribute('aria-label') || '').slice(0, 80);
     }
 
@@ -392,32 +412,8 @@ async function openComposer(page) {
 
   if (clicked) {
     console.log(`Opened composer with text: ${clicked}`);
-    await sleep(2500);
-    const hasDialogTextbox = await page.evaluate(() =>
-      Boolean((document.querySelector('[role="dialog"]') || document).querySelector('[role="textbox"], div[contenteditable="true"], div[data-lexical-editor="true"]'))
-    );
-    if (hasDialogTextbox) return true;
+    if (await waitForComposerDialog()) return true;
     console.log('Composer click did not open a dialog textbox');
-  }
-
-  const textboxClicked = await page.evaluate(() => {
-    const boxes = [...document.querySelectorAll('[role="textbox"], div[contenteditable="true"], div[data-lexical-editor="true"]')]
-      .filter(el => {
-        const rect = el.getBoundingClientRect();
-        const text = (el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
-        return rect.width > 160 && rect.height > 20 && text.length < 180;
-      });
-
-    const box = boxes[0];
-    if (!box) return null;
-    box.click();
-    return (box.textContent || box.getAttribute('aria-label') || '').slice(0, 80);
-  });
-
-  if (textboxClicked !== null) {
-    console.log(`Opened composer with textbox: ${textboxClicked}`);
-    await sleep(2500);
-    return true;
   }
 
   const ariaSelectors = [
@@ -432,8 +428,7 @@ async function openComposer(page) {
       await page.waitForSelector(selector, { timeout: 4000 });
       await page.click(selector);
       console.log(`Opened composer with ${selector}`);
-      await sleep(2500);
-      return true;
+      if (await waitForComposerDialog()) return true;
     } catch {}
   }
 
@@ -472,6 +467,11 @@ async function uploadImages(page, imagePaths) {
   const validPaths = imagePaths.filter(filePath => fs.existsSync(filePath));
   if (!validPaths.length) return;
 
+  const hasComposerDialog = await page.evaluate(() =>
+    Boolean(document.querySelector('[role="dialog"] [role="textbox"], [role="dialog"] div[contenteditable="true"], [role="dialog"] div[data-lexical-editor="true"]'))
+  );
+  if (!hasComposerDialog) throw new Error('Composer dialog is not open');
+
   let input = await page.$('[role="dialog"] input[type="file"], input[type="file"][accept*="image"]');
   if (!input) {
     await page.evaluate(() => {
@@ -499,7 +499,9 @@ async function clickPost(page) {
     for (const button of buttons) {
       const text = normalize(button.textContent || button.getAttribute('aria-label') || '');
       const disabled = button.disabled || button.getAttribute('aria-disabled') === 'true';
-      if (!disabled && (wanted.includes(text) || wanted.some(label => text.includes(label)))) {
+      const rect = button.getBoundingClientRect();
+      const isReasonableButton = rect.width > 20 && rect.height > 10 && text.length > 0 && text.length < 40;
+      if (!disabled && isReasonableButton && wanted.includes(text)) {
         button.click();
         return text;
       }
@@ -550,7 +552,7 @@ async function clickPost(page) {
         aria: el.getAttribute('aria-label'),
         disabled: el.disabled || el.getAttribute('aria-disabled') === 'true'
       }))
-      .filter(item => (item.text || item.aria) && !item.disabled)
+      .filter(item => (item.text || item.aria) && !item.disabled && (item.text || item.aria || '').length < 80)
       .slice(0, 40)
   );
 
