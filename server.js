@@ -4,21 +4,21 @@
  * Simplified approach: Use persistent profile to maintain browser state.
  * Don't rely on exported cookies — let the profile handle authentication naturally.
  */
- 
+
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
- 
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 const COOKIE_PATH = '/tmp/fb-cookies.json';
 const PROFILE_DIR = '/tmp/chrome-profile';
- 
+
 let currentSession = null;
 let posterRunning = false;
- 
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = '/tmp/watch-images';
@@ -30,15 +30,15 @@ const storage = multer.diskStorage({
     cb(null, `img_${Date.now()}_${Math.random().toString(36).slice(2, 7)}${ext}`);
   }
 });
- 
+
 const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
- 
+
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
- 
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
- 
+
 // ─── SETUP ───
 function ensureProfileDir() {
   if (!fs.existsSync(PROFILE_DIR)) {
@@ -46,7 +46,7 @@ function ensureProfileDir() {
     console.log(`📁 Created Chrome profile directory: ${PROFILE_DIR}`);
   }
 }
- 
+
 function saveCookies(cookies) {
   const cleaned = (cookies || [])
     .filter(c => c && c.name && c.value)
@@ -60,17 +60,17 @@ function saveCookies(cookies) {
       ...(c.expires && { expires: c.expires }),
       ...(c.sameSite && { sameSite: c.sameSite })
     }));
- 
+
   fs.writeFileSync(COOKIE_PATH, JSON.stringify(cleaned, null, 2));
   console.log(`💾 Saved ${cleaned.length} cookies`);
   return cleaned;
 }
- 
+
 function loadCookies() {
   if (!fs.existsSync(COOKIE_PATH)) {
     return [];
   }
- 
+
   try {
     const raw = JSON.parse(fs.readFileSync(COOKIE_PATH, 'utf8'));
     return Array.isArray(raw) ? raw : [];
@@ -79,11 +79,11 @@ function loadCookies() {
     return [];
   }
 }
- 
+
 async function launchBrowser() {
   const puppeteer = require('puppeteer');
   ensureProfileDir();
- 
+
   console.log(`🌐 Launching Chrome with profile: ${PROFILE_DIR}`);
   
   return puppeteer.launch({
@@ -97,7 +97,7 @@ async function launchBrowser() {
     ]
   });
 }
- 
+
 // ─── ENDPOINTS ───
 app.get('/status', (req, res) => {
   res.json({
@@ -114,21 +114,21 @@ app.get('/status', (req, res) => {
     } : null
   });
 });
- 
+
 app.post('/save-cookies', (req, res) => {
   const { cookies, secret } = req.body;
- 
+
   if (!cookies || !Array.isArray(cookies)) {
     return res.status(400).json({ error: 'Cookies must be an array' });
   }
- 
+
   if (secret !== process.env.SECRET_KEY) {
     return res.status(403).json({ error: 'Invalid secret' });
   }
- 
+
   const saved = saveCookies(cookies);
   const names = saved.map(c => c.name);
- 
+
   res.json({
     ok: true,
     count: saved.length,
@@ -136,15 +136,15 @@ app.post('/save-cookies', (req, res) => {
     message: '✅ Cookies stored. They will be imported into the Chrome profile on first use.'
   });
 });
- 
+
 app.get('/check-login', async (req, res) => {
   console.log('\n📋 /check-login: Testing Chrome profile...');
   const browser = await launchBrowser();
- 
+
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
- 
+
     const cookies = loadCookies();
     if (cookies.length > 0) {
       console.log(`📋 Importing ${cookies.length} cookies into profile`);
@@ -154,21 +154,21 @@ app.get('/check-login', async (req, res) => {
         console.warn('⚠️ Could not set all cookies:', err.message);
       }
     }
- 
+
     console.log('📋 Loading facebook.com...');
     await page.goto('https://www.facebook.com/', { waitUntil: 'networkidle2' });
     await sleep(3000);
- 
+
     const allCookies = await page.cookies();
     const browserCookieNames = allCookies.map(c => c.name);
- 
+
     const result = await page.evaluate(() => ({
       url: location.href,
       title: document.title,
       hasLoginForm: !!document.querySelector('#loginform') || !!document.querySelector('[data-testid="royal_login_form"]'),
       hasProfileLink: !!document.querySelector('[aria-label="Your profile"]')
     }));
- 
+
     res.json({
       ...result,
       savedCookieNames: cookies.map(c => c.name),
@@ -176,7 +176,7 @@ app.get('/check-login', async (req, res) => {
       readyToPost: !result.hasLoginForm,
       status: !result.hasLoginForm ? '✅ Logged in' : '❌ Not logged in'
     });
- 
+
   } catch (err) {
     console.error('❌ Error:', err.message);
     res.status(500).json({ error: err.message });
@@ -184,19 +184,19 @@ app.get('/check-login', async (req, res) => {
     await browser.close();
   }
 });
- 
+
 app.post('/start', upload.array('images', 20), async (req, res) => {
   try {
     if (posterRunning) {
       return res.status(409).json({ error: 'Already running' });
     }
- 
+
     const { caption, groups } = req.body;
     if (!caption) return res.status(400).json({ error: 'Caption required' });
- 
+
     const parsedGroups = JSON.parse(groups);
     const imagePaths = (req.files || []).map(f => f.path);
- 
+
     currentSession = {
       id: Date.now(),
       caption,
@@ -206,43 +206,43 @@ app.post('/start', upload.array('images', 20), async (req, res) => {
       stopped: false,
       startedAt: new Date().toISOString()
     };
- 
+
     res.json({
       ok: true,
       sessionId: currentSession.id,
       groups: parsedGroups.length,
       images: imagePaths.length
     });
- 
+
     runPoster().catch(err => {
       console.error('Poster error:', err);
       posterRunning = false;
     });
- 
+
   } catch (err) {
     console.error('/start error:', err);
     res.status(500).json({ error: err.message });
   }
 });
- 
+
 app.post('/stop', (req, res) => {
   if (currentSession) currentSession.stopped = true;
   res.json({ ok: true });
 });
- 
+
 // ─── POSTER ───
 async function runPoster() {
   posterRunning = true;
   const session = currentSession;
   console.log(`\n🎬 Posting session: ${session.groups.length} groups`);
- 
+
   const browser = await launchBrowser();
- 
+
   try {
     const page = await browser.newPage();
     page.setDefaultTimeout(30000);
     await page.setViewport({ width: 1280, height: 800 });
- 
+
     const cookies = loadCookies();
     if (cookies.length > 0) {
       console.log(`🍪 Importing ${cookies.length} cookies`);
@@ -252,70 +252,78 @@ async function runPoster() {
         console.warn('⚠️ Some cookies failed:', err.message);
       }
     }
- 
+
     console.log('📄 Loading facebook.com...');
     await page.goto('https://www.facebook.com/', { waitUntil: 'networkidle2' });
     await sleep(4000);
- 
+
     const pageTitle = await page.title();
     console.log(`   Title: ${pageTitle}`);
- 
+
     const isLoginPage = await page.evaluate(() =>
       !!document.querySelector('#loginform') ||
       !!document.querySelector('[data-testid="royal_login_form"]')
     );
- 
+
     if (isLoginPage) {
       throw new Error('Detected login page. Not authenticated.');
     }
- 
+
     console.log('✅ Authenticated');
- 
+
     const pending = session.groups.filter(g => g.postStatus === 'pending' && g.link);
- 
+
     for (let i = 0; i < pending.length; i++) {
       if (session.stopped) break;
- 
+
       const group = pending[i];
       console.log(`\n[${i + 1}/${pending.length}] → ${group.name}`);
- 
+
       try {
         await page.goto(group.link, { waitUntil: 'networkidle2', timeout: 30000 });
         await sleep(5000 + rand(0, 2000));
- 
+
         const composerOpened = await openComposer(page);
         if (!composerOpened) throw new Error('Composer not found');
-        await sleep(2000);
- 
+        await sleep(3000); // give modal time to fully load
+
         await page.keyboard.type(session.caption, { delay: rand(30, 80) });
         await sleep(1500);
- 
+
+        // Confirm text was actually typed
+        const typedText = await page.evaluate(() => {
+          const box = document.querySelector('[role="dialog"] div[role="textbox"]') ||
+                      document.querySelector('div[role="textbox"][contenteditable="true"]');
+          return box ? box.innerText.trim() : '';
+        });
+        console.log(`   Caption preview: "${typedText.slice(0, 60)}"`);
+
         if (session.imagePaths.length > 0) {
           await uploadImages(page, session.imagePaths);
           await sleep(5000); // extra wait after image upload so Post button enables
         }
- 
+
         const posted = await clickPost(page);
         if (!posted) throw new Error('Post button not found');
- 
+
         await sleep(3000);
         group.postStatus = 'done';
         session.progress.done++;
         console.log(`   ✅ Posted`);
- 
+
         if (i < pending.length - 1) {
           const wait = 60 * 1000 + rand(0, 30000);
           console.log(`   ⏳ Waiting ${Math.round(wait / 60000)} min`);
           await sleep(wait);
         }
- 
+
       } catch (err) {
         console.error(`   ❌ ${err.message}`);
         group.postStatus = 'failed';
         await sleep(2000);
       }
     }
- 
+
   } catch (err) {
     console.error(`💥 ${err.message}`);
     session.groups.forEach(g => {
@@ -327,10 +335,10 @@ async function runPoster() {
     console.log('\n🎉 Complete\n');
   }
 }
- 
+
 async function openComposer(page) {
   console.log('   Looking for post composer...');
- 
+
   const selectors = [
     '[aria-label="Write something to the group..."]',
     '[aria-label="Write something to the group…"]',
@@ -341,26 +349,32 @@ async function openComposer(page) {
     'div[role="textbox"][contenteditable="true"]',
     'div[data-lexical-editor="true"]'
   ];
- 
+
   for (const sel of selectors) {
     try {
-      const elements = await page.$$(sel);
-      if (elements.length > 0) {
-        await page.evaluate((selector) => {
-          const el = document.querySelector(selector);
-          if (el) {
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            el.click();
-          }
-        }, sel);
-        
-        await sleep(1500);
+      const el = await page.$(sel);
+      if (el) {
+        await el.scrollIntoView();
+        await el.click();
+        await sleep(3000); // wait for full modal to open
+
+        // Check if a dialog/modal opened with a fresh textbox inside
+        const modal = await page.$('[role="dialog"] div[role="textbox"]') ||
+                      await page.$('[role="dialog"] div[contenteditable="true"]');
+
+        if (modal) {
+          await modal.click();
+          console.log(`   ✓ Opened with: ${sel} (modal confirmed)`);
+          return true;
+        }
+
+        // No modal, but element was found — use it directly
         console.log(`   ✓ Opened with: ${sel}`);
         return true;
       }
     } catch {}
   }
- 
+
   try {
     const foundButton = await page.evaluate(() => {
       const buttons = document.querySelectorAll('button, [role="button"], div[role="button"]');
@@ -373,51 +387,51 @@ async function openComposer(page) {
       }
       return false;
     });
- 
+
     if (foundButton) {
-      await sleep(1500);
+      await sleep(3000);
       console.log(`   ✓ Opened by clicking button text`);
       return true;
     }
   } catch {}
- 
+
   try {
     await page.screenshot({ path: '/tmp/composer-not-found.png' });
     console.log('   📸 Screenshot saved: /tmp/composer-not-found.png');
   } catch {}
- 
+
   return false;
 }
- 
+
 async function uploadImages(page, imagePaths) {
   const valid = imagePaths.filter(p => fs.existsSync(p));
   if (!valid.length) return;
- 
+
   console.log(`   Uploading ${valid.length} image(s)...`);
- 
+
   let input = await page.$('input[type="file"]');
   if (input) {
     await input.uploadFile(...valid);
     console.log(`   ✓ Uploaded`);
     return;
   }
- 
+
   input = await page.$('input[type="file"][accept*="image"]');
   if (input) {
     await input.uploadFile(...valid);
     console.log(`   ✓ Uploaded`);
     return;
   }
- 
+
   console.log('   ⚠️ Could not find file input');
 }
- 
+
 async function clickPost(page) {
   console.log('   Looking for Post button...');
- 
+
   // Wait longer for Post button to become enabled after image upload
   await sleep(3000);
- 
+
   // ── Approach 1: aria-label exact match ──
   try {
     for (const label of ['Post', 'โพสต์', 'ลงประกาศ', 'Share', 'แชร์']) {
@@ -433,13 +447,13 @@ async function clickPost(page) {
       }
     }
   } catch {}
- 
+
   // ── Approach 2: button text match (Thai + English) ──
   try {
     const found = await page.evaluate(() => {
       const postWords = ['post', 'โพสต์', 'ลงประกาศ', 'share', 'แชร์', 'list', 'ส่ง'];
       const buttons = document.querySelectorAll('button, [role="button"]');
- 
+
       // Exact match first
       for (const btn of buttons) {
         const text = btn.textContent.trim().toLowerCase();
@@ -454,7 +468,7 @@ async function clickPost(page) {
           return `aria: "${aria}"`;
         }
       }
- 
+
       // Partial match fallback
       for (const btn of buttons) {
         const text = btn.textContent.trim().toLowerCase();
@@ -464,16 +478,16 @@ async function clickPost(page) {
           return `partial: "${btn.textContent.trim()}"`;
         }
       }
- 
+
       return null;
     });
- 
+
     if (found) {
       console.log(`   ✓ Clicked Post button (${found})`);
       return true;
     }
   } catch {}
- 
+
   // ── Approach 3: Ctrl+Enter keyboard shortcut ──
   // This works regardless of button label or language
   try {
@@ -485,7 +499,7 @@ async function clickPost(page) {
     console.log('   ✓ Sent Ctrl+Enter');
     return true;
   } catch {}
- 
+
   // ── Debug: log all buttons seen ──
   try {
     const allButtons = await page.evaluate(() =>
@@ -496,12 +510,11 @@ async function clickPost(page) {
     console.log('   All buttons found:');
     allButtons.forEach(b => console.log(`     ${b}`));
   } catch {}
- 
+
   return false;
 }
- 
+
 ensureProfileDir();
 app.listen(PORT, () => {
   console.log(`✅ Watch Auto-Poster ready on port ${PORT}\n`);
 });
- 
