@@ -122,20 +122,41 @@ function launchBrowser() {
   });
 }
 
-async function openComposer(page) {
-  await sleep(3000);
+async function uploadImages(page, imagePaths) {
+  const validPaths = imagePaths.filter(p => fs.existsSync(p));
+  if (!validPaths.length) return;
 
-  const selectors = [
-    '[aria-label="Write something to the group…"]',
-    '[aria-label="Write something to the group..."]',
-    '[aria-label="Write something..."]',
-    '[aria-label="Create a public post…"]',
-    '[aria-label="Create a public post..."]',
-    '[aria-label="What\'s on your mind?"]',
-    '[data-testid="status-attachment-mentions-input"]',
-    'div[contenteditable="true"]',
-    '[role="textbox"]'
-  ];
+  console.log(`  📸 Preparing to upload ${validPaths.length} watch image(s)...`);
+
+  for (let i = 0; i < validPaths.length; i++) {
+    const currentPath = validPaths[i];
+    
+    // Find the file input field again on each iteration as the DOM might refresh
+    let input = await page.$('input[type="file"][accept*="image"]');
+    if (!input) {
+      await page.evaluate(() => {
+        for (const b of document.querySelectorAll('[role="button"]')) {
+          if (/photo|video|รูปภาพ|วิดีโอ/i.test(b.textContent)) { b.click(); return; }
+        }
+      });
+      await sleep(2000);
+      input = await page.$('input[type="file"]');
+    }
+
+    if (input) {
+      // Upload one file at a time to prevent the "multiple" attribute error
+      await input.uploadFile(currentPath);
+      console.log(`    📎 Image [${i + 1}/${validPaths.length}] attached successfully.`);
+      
+      // Short delay between uploads so Facebook's UI can process the file sequential addition
+      await sleep(2500); 
+    } else {
+      console.error(`    ❌ Could not find the file input element for image ${i + 1}`);
+    }
+  }
+  
+  console.log(`  ✅ All ${validPaths.length} image(s) uploaded successfully!`);
+}
 
   for (const sel of selectors) {
     try {
