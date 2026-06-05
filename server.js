@@ -1,3 +1,403 @@
+/**
+ * Watch Auto-Poster — Railway Server
+ * Updated: supports auto-comments (2 slots, each with images + text)
+ */
+
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+let currentSession = null;
+let posterRunning = false;
+
+// ─── Multer: store all uploaded images in /tmp ───
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = '/tmp/watch-images';
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `img_${Date.now()}_${Math.random().toString(36).slice(2,7)}${ext}`);
+  }
+});
+const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
+
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+
+// ─── STATUS ───
+app.get('/status', (req, res) => {
+  res.json({
+    online: true,
+    running: posterRunning,
+    session: currentSession ? {
+      id: currentSession.id,
+      done: currentSession.progress.done,
+      total: currentSession.progress.total,
+      groups: currentSession.groups.map(g => ({
+        id: g.id, name: g.name, status: g.postStatus
+      }))
+    } : null
+  });
+});
+
+// ─── START POSTER ───
+// Accepts: images[], comment1Images[], comment2Images[], caption, title, comment1Text, comment2Text, groups
+app.post('/start-poster', upload.fields([
+  { name: 'images', maxCount: 20 },
+  { name: 'comment1Images', maxCount: 10 },
+  { name: 'comment2Images', maxCount: 10 }
+]), async (req, res) => {
+  try {
+    if (posterRunning) return res.status(409).json({ error: 'Already running. Stop first.' });
+
+    const { caption, title, groups, comment1Text, comment2Text } = req.body;
+    if (!caption && !(req.files['images'] && req.files['images'].length))
+      return res.status(400).json({ error: 'Caption or images required' });
+
+    const parsedGroups = JSON.parse(groups);
+    const imagePaths      = (req.files['images']         || []).map(f => f.path);
+    const comment1Images  = (req.files['comment1Images'] || []).map(f => f.path);
+    const comment2Images  = (req.files['comment2Images'] || []).map(f => f.path);
+
+    currentSession = {
+      id: Date.now(),
+      title:         title        || '',
+      caption:       caption      || '',
+      imagePaths,
+      comment1: { text: comment1Text || '', images: comment1Images },
+      comment2: { text: comment2Text || '', images: comment2Images },
+      groups: parsedGroups.map(g => ({ ...g, postStatus: 'pending' })),
+      progress: { done: 0, total: parsedGroups.length },
+      stopped: false,
+      startedAt: new Date().toISOString()
+    };
+
+    res.json({ ok: true, sessionId: currentSession.id, groups: parsedGroups.length, images: imagePaths.length });
+
+    runPoster().catch(err => {
+      console.error('Poster error:', err);
+      posterRunning = false;
+    });
+
+  } catch (e) {
+    console.error('/start-poster error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── STOP ───
+app.post('/stop-poster', (req, res) => {
+  if (currentSession) currentSession.stopped = true;
+  res.json({ ok: true });
+});
+
+// ─── HELPERS ───
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const rand  = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+function loadCookies() {
+  const cookiePath = '/tmp/fb-cookies.json';
+  if (!fs.existsSync(cookiePath)) return [];
+  const raw = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
+  return raw.map(c => ({
+    name: c.name, value: c.value,
+    domain: c.domain || '.facebook.com',
+    path: c.path || '/',
+    httpOnly: c.httpOnly || false,
+    secure: c.secure || false,
+    sameSite: 'None'
+  }));
+}
+
+function launchBrowser() {
+  const puppeteer = require('puppeteer');
+  return puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process']
+  });
+}
+
+async function openComposer(page) {
+  await sleep(3000);
+  const selectors = [
+    '[aria-label="Write something to the group…"]',
+    '[aria-label="Write something to the group..."]',
+    '[aria-label="Write something..."]',
+    '[aria-label="Create a public post…"]',
+    '[aria-label="Create a public post..."]',
+    '[aria-label="What\'s on your mind?"]',
+    '[data-testid="status-attachment-mentions-input"]'
+  ];
+  for (const sel of selectors) {
+    try {
+      const el = await page.waitForSelector(sel, { timeout: 5000 });
+      if (el) {
+        await el.evaluate(e => e.scrollIntoView());
+        await sleep(500);
+        await el.click();
+        await sleep(1500);
+        return await focusComposerEditor(page);
+      }
+    } catch {}
+  }
+  const found = await page.evaluate(() => {
+    const patterns = [/write something/i, /what.s on your mind/i, /create a post/i, /เขียนอะไรบางอย่าง/i];
+    for (const el of [...document.querySelectorAll('[role="button"]'), ...document.querySelectorAll('div[tabindex]')]) {
+      const text = el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.textContent || '';
+      if (patterns.some(p => p.test(text))) { el.click(); return true; }
+    }
+    return false;
+  });
+  if (found) { await sleep(2000); return await focusComposerEditor(page); }
+  await page.screenshot({ path: '/tmp/composer-debug.png' });
+  return false;
+}
+
+async function focusComposerEditor(page) {
+  return await page.evaluate(() => {
+    const badLabels = [/write a comment/i, /แสดงความคิดเห็น/i, /comment/i];
+    const isBadEditor = el => {
+      const text = el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+      return badLabels.some(pattern => pattern.test(text));
+    };
+    const roots = [
+      ...document.querySelectorAll('[role="dialog"]'),
+      document.body
+    ].filter(Boolean);
+
+    for (const root of roots) {
+      const editors = [...root.querySelectorAll('[contenteditable="true"], [role="textbox"]')];
+      const editor = editors.find(el => !isBadEditor(el));
+      if (editor) {
+        editor.focus();
+        editor.click();
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+async function uploadImages(page, imagePaths) {
+  const validPaths = imagePaths.filter(p => fs.existsSync(p));
+  if (!validPaths.length) return;
+  console.log(`  📸 Uploading ${validPaths.length} image(s)...`);
+
+  // Click the photo/video button to reveal the file input
+  let input = await page.$('input[type="file"][accept*="image"]');
+  if (!input) {
+    await page.evaluate(() => {
+      for (const b of document.querySelectorAll('[role="button"]')) {
+        if (/photo|video|รูปภาพ|วิดีโอ/i.test(b.textContent)) { b.click(); return; }
+      }
+    });
+    await sleep(2000);
+    input = await page.$('input[type="file"]');
+  }
+
+  if (!input) {
+    console.error('    ❌ No file input found');
+    return;
+  }
+
+  // Upload ALL images in one call — preserves exact order
+  await input.uploadFile(...validPaths);
+  console.log(`    📎 All ${validPaths.length} image(s) queued in order`);
+  await sleep(4000); // wait for Facebook to process all uploads
+  console.log(`  ✅ All ${validPaths.length} image(s) uploaded`);
+}
+
+async function clickPost(page) {
+  const selectors = [
+    'div[aria-label="Post"]','div[aria-label="โพสต์"]','button[type="submit"]',
+    '[data-testid="react-composer-post-button"]','div[role="button"][tabindex="0"]'
+  ];
+  for (const sel of selectors) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) {
+        const isOk = await btn.evaluate(el => {
+          const text = (el.innerText || el.textContent || '').trim();
+          return el.getAttribute('aria-label') === 'Post' || el.getAttribute('aria-label') === 'โพสต์' || text === 'Post' || text === 'โพสต์';
+        });
+        if (isOk) {
+          const disabled = await btn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true');
+          if (!disabled) { await btn.click(); return true; }
+        }
+      }
+    } catch {}
+  }
+  const clicked = await page.evaluate(() => {
+    for (const el of document.querySelectorAll('div[role="button"], button, span, div')) {
+      const text = (el.innerText || el.textContent || '').trim();
+      if (['โพสต์','Post','ลงประกาศ','แชร์','Publish'].includes(text) && !el.disabled && el.getAttribute('aria-disabled') !== 'true') {
+        el.click(); return text;
+      }
+    }
+    return null;
+  });
+  if (clicked) return true;
+  await page.keyboard.down('Control');
+  await page.keyboard.press('Enter');
+  await page.keyboard.up('Control');
+  await sleep(4000);
+  return true;
+}
+
+async function findOwnPostScope(page, anchorText) {
+  const anchor = (anchorText || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+  if (!anchor) return null;
+
+  const scope = await page.evaluateHandle((text) => {
+    const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+    const needle = normalize(text);
+    const candidates = [
+      ...document.querySelectorAll('[role="dialog"] [role="article"]'),
+      ...document.querySelectorAll('[role="article"]'),
+      ...document.querySelectorAll('[data-pagelet^="FeedUnit"]')
+    ];
+
+    for (const candidate of candidates) {
+      const haystack = normalize(candidate.innerText || candidate.textContent);
+      if (haystack.includes(needle)) return candidate;
+    }
+    return null;
+  }, anchor);
+
+  const element = scope.asElement();
+  if (!element) {
+    try { await scope.dispose(); } catch {}
+    return null;
+  }
+  return element;
+}
+
+async function findCommentBoxInScope(scope) {
+  const selectors = [
+    '[aria-label="Write a comment…"]',
+    '[aria-label="Write a comment..."]',
+    '[aria-label="แสดงความคิดเห็น…"]',
+    '[aria-label="แสดงความคิดเห็น..."]',
+    'form[role="presentation"] div[contenteditable="true"]',
+    'div[contenteditable="true"][data-lexical-editor="true"]'
+  ];
+
+  for (const sel of selectors) {
+    try {
+      const boxes = await scope.$$(sel);
+      if (boxes && boxes.length > 0) return boxes[boxes.length - 1];
+    } catch {}
+  }
+
+  const box = await scope.evaluateHandle(() => {
+    const patterns = [/write a comment/i, /แสดงความคิดเห็น/i];
+    const candidates = [...document.querySelectorAll('[contenteditable="true"], [placeholder], [aria-label]')];
+    return candidates.find(el => {
+      const text = el.getAttribute('placeholder') || el.getAttribute('aria-label') || '';
+      return patterns.some(pattern => pattern.test(text));
+    }) || null;
+  });
+
+  const element = box.asElement();
+  if (!element) {
+    try { await box.dispose(); } catch {}
+    return null;
+  }
+  return element;
+}
+
+// ─── POST A COMMENT (text + images) ───
+async function postComment(page, commentText, commentImages, label, anchorText) {
+  console.log(`  💬 Posting ${label}...`);
+  try {
+    await sleep(4000);
+
+    const postScope = await findOwnPostScope(page, anchorText);
+    if (!postScope) {
+      console.error(`  ❌ ${label}: Could not locate the newly submitted post. Skipping comment to avoid posting on someone else's post.`);
+      return false;
+    }
+
+    const commentBox = await findCommentBoxInScope(postScope);
+    if (!commentBox) {
+      console.error(`  ❌ ${label}: Could not find a comment box inside the newly submitted post. Skipping.`);
+      return false;
+    }
+
+    await commentBox.evaluate(el => el.scrollIntoView({ block: 'center' }));
+    await sleep(500);
+    await commentBox.click();
+    await sleep(800);
+    console.log(`    ✅ Comment box found inside the new post`);
+
+    // Upload images to the comment if any
+    if (commentImages && commentImages.length > 0) {
+      const validImages = commentImages.filter(p => fs.existsSync(p));
+      if (validImages.length > 0) {
+        const attachClicked = await postScope.evaluate(() => {
+          const patterns = [/photo/i, /รูปภาพ/i, /image/i, /attach/i];
+          for (const el of document.querySelectorAll('[role="button"], button, label')) {
+            const txt = el.getAttribute('aria-label') || el.textContent || '';
+            if (patterns.some(p => p.test(txt))) { el.click(); return true; }
+          }
+          return false;
+        });
+
+        if (attachClicked) {
+          await sleep(1500);
+          const imgInput = await page.$('input[type="file"]');
+          if (imgInput) {
+            // Upload all comment images in one call
+            await imgInput.uploadFile(...validImages);
+            await sleep(2000);
+            console.log(`    📎 ${label} ${validImages.length} image(s) attached`);
+          }
+        } else {
+          console.log(`  ⚠️ ${label}: No attach button found, skipping images`);
+        }
+        await sleep(1500);
+      }
+    }
+
+    // Type comment text
+    if (commentText && commentText.trim()) {
+      await page.keyboard.type(commentText.trim(), { delay: rand(20, 60) });
+      await sleep(800);
+    }
+
+    // Submit: try Enter first, then Ctrl+Enter as fallback
+    await page.keyboard.press('Enter');
+    await sleep(2000);
+
+    // Check if the box still has content (Enter didn't submit) → try Ctrl+Enter
+    const stillHasContent = await page.evaluate(() => {
+      const el = document.activeElement;
+      return el && el.textContent && el.textContent.trim().length > 0;
+    });
+    if (stillHasContent) {
+      await page.keyboard.down('Control');
+      await page.keyboard.press('Enter');
+      await page.keyboard.up('Control');
+      await sleep(2000);
+    }
+
+    console.log(`  ✅ ${label} posted!`);
+    return true;
+
+  } catch (err) {
+    console.error(`  ❌ ${label} failed: ${err.message}`);
+    return false;
+  }
+}
+
 // ─── BACKGROUND POSTER ───
 async function runPoster() {
   posterRunning = true;
