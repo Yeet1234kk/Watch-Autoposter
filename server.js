@@ -128,11 +128,16 @@ function launchBrowser() {
 async function openComposer(page) {
   await sleep(3000);
   const selectors = [
+    '[aria-label*="Write something"]',
     '[aria-label="Write something to the group…"]',
     '[aria-label="Write something to the group..."]',
     '[aria-label="Write something..."]',
+    '[aria-label*="Create post"]',
+    '[aria-label*="Create a post"]',
     '[aria-label="Create a public post…"]',
     '[aria-label="Create a public post..."]',
+    '[aria-label*="mind"]',
+    '[aria-label*="Sell something"]',
     '[aria-label="What\'s on your mind?"]',
     '[data-testid="status-attachment-mentions-input"]'
   ];
@@ -143,27 +148,56 @@ async function openComposer(page) {
         await el.evaluate(e => e.scrollIntoView());
         await sleep(500);
         await el.click();
-        await sleep(1500);
-        return await focusComposerEditor(page);
+        await sleep(2000);
+        if (await waitForComposerEditor(page)) return true;
       }
     } catch {}
   }
   const found = await page.evaluate(() => {
-    const patterns = [/write something/i, /what.s on your mind/i, /create a post/i, /เขียนอะไรบางอย่าง/i];
-    for (const el of [...document.querySelectorAll('[role="button"]'), ...document.querySelectorAll('div[tabindex]')]) {
+    const patterns = [
+      /write something/i,
+      /what.s on your mind/i,
+      /create (a )?(public )?post/i,
+      /sell something/i,
+      /เขียน/i,
+      /สร้างโพสต์/i,
+      /คุณกำลังคิดอะไร/i,
+      /ขายสินค้า/i
+    ];
+    const badPatterns = [/comment/i, /reply/i, /share/i, /like/i, /แสดงความคิดเห็น/i, /ตอบกลับ/i, /แชร์/i, /ถูกใจ/i];
+    const candidates = [
+      ...document.querySelectorAll('[role="button"]'),
+      ...document.querySelectorAll('div[tabindex]'),
+      ...document.querySelectorAll('[aria-label]')
+    ];
+    for (const el of candidates) {
       const text = el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.textContent || '';
-      if (patterns.some(p => p.test(text))) { el.click(); return true; }
+      if (badPatterns.some(p => p.test(text))) continue;
+      if (patterns.some(p => p.test(text))) {
+        const button = el.closest('[role="button"], div[tabindex], button') || el;
+        button.click();
+        return true;
+      }
     }
     return false;
   });
-  if (found) { await sleep(2000); return await focusComposerEditor(page); }
+  if (found) { await sleep(2500); return await waitForComposerEditor(page); }
   await page.screenshot({ path: '/tmp/composer-debug.png' });
+  return false;
+}
+
+async function waitForComposerEditor(page, timeoutMs = 10000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await focusComposerEditor(page)) return true;
+    await sleep(500);
+  }
   return false;
 }
 
 async function focusComposerEditor(page) {
   return await page.evaluate(() => {
-    const badLabels = [/write a comment/i, /แสดงความคิดเห็น/i, /comment/i];
+    const badLabels = [/write a comment/i, /แสดงความคิดเห็น/i, /comment/i, /reply/i, /ตอบกลับ/i];
     const isBadEditor = el => {
       const text = el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
       return badLabels.some(pattern => pattern.test(text));
@@ -454,7 +488,7 @@ async function runPoster() {
         await sleep(2000);
 
         // Re-click the post composer to guarantee focus before typing.
-        const focused = await focusComposerEditor(page);
+        const focused = await waitForComposerEditor(page);
         if (!focused) throw new Error('Could not focus composer');
         await sleep(500);
 
