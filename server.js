@@ -161,25 +161,28 @@ async function uploadImages(page, imagePaths) {
   const validPaths = imagePaths.filter(p => fs.existsSync(p));
   if (!validPaths.length) return;
   console.log(`  📸 Uploading ${validPaths.length} image(s)...`);
-  for (let i = 0; i < validPaths.length; i++) {
-    let input = await page.$('input[type="file"][accept*="image"]');
-    if (!input) {
-      await page.evaluate(() => {
-        for (const b of document.querySelectorAll('[role="button"]')) {
-          if (/photo|video|รูปภาพ|วิดีโอ/i.test(b.textContent)) { b.click(); return; }
-        }
-      });
-      await sleep(2000);
-      input = await page.$('input[type="file"]');
-    }
-    if (input) {
-      await input.uploadFile(validPaths[i]);
-      console.log(`    📎 Image [${i+1}/${validPaths.length}] attached`);
-      await sleep(2500);
-    } else {
-      console.error(`    ❌ No file input found for image ${i+1}`);
-    }
+
+  // Click the photo/video button to reveal the file input
+  let input = await page.$('input[type="file"][accept*="image"]');
+  if (!input) {
+    await page.evaluate(() => {
+      for (const b of document.querySelectorAll('[role="button"]')) {
+        if (/photo|video|รูปภาพ|วิดีโอ/i.test(b.textContent)) { b.click(); return; }
+      }
+    });
+    await sleep(2000);
+    input = await page.$('input[type="file"]');
   }
+
+  if (!input) {
+    console.error('    ❌ No file input found');
+    return;
+  }
+
+  // Upload ALL images in one call — preserves exact order
+  await input.uploadFile(...validPaths);
+  console.log(`    📎 All ${validPaths.length} image(s) queued in order`);
+  await sleep(4000); // wait for Facebook to process all uploads
   console.log(`  ✅ All ${validPaths.length} image(s) uploaded`);
 }
 
@@ -224,10 +227,13 @@ async function clickPost(page) {
 async function postComment(page, commentText, commentImages, label) {
   console.log(`  💬 Posting ${label}...`);
   try {
-    // Wait for the post to appear and find the comment box
     await sleep(4000);
 
-    // Click the "Write a comment" box — try multiple selectors
+    // Scroll to the bottom of the page to find the newly posted item
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await sleep(2000);
+
+    // Try to find the most recent post's comment box (last one on page)
     const commentSelectors = [
       '[aria-label="Write a comment…"]',
       '[aria-label="Write a comment..."]',
@@ -238,10 +244,20 @@ async function postComment(page, commentText, commentImages, label) {
     ];
 
     let commentBox = null;
+
+    // Try to get the LAST matching comment box (most recent post)
     for (const sel of commentSelectors) {
       try {
-        commentBox = await page.waitForSelector(sel, { timeout: 6000 });
-        if (commentBox) { await commentBox.click(); await sleep(800); break; }
+        const all = await page.$$(sel);
+        if (all && all.length > 0) {
+          commentBox = all[all.length - 1]; // last = newest post
+          await commentBox.evaluate(el => el.scrollIntoView({ block: 'center' }));
+          await sleep(500);
+          await commentBox.click();
+          await sleep(800);
+          console.log(`    ✅ Comment box found via: ${sel}`);
+          break;
+        }
       } catch {}
     }
 
@@ -249,9 +265,11 @@ async function postComment(page, commentText, commentImages, label) {
     if (!commentBox) {
       const found = await page.evaluate(() => {
         const patterns = [/write a comment/i, /แสดงความคิดเห็น/i, /comment/i];
-        for (const el of document.querySelectorAll('[contenteditable="true"], [placeholder]')) {
+        const all = [...document.querySelectorAll('[contenteditable="true"], [placeholder]')];
+        for (let i = all.length - 1; i >= 0; i--) {
+          const el = all[i];
           const txt = el.getAttribute('placeholder') || el.getAttribute('aria-label') || '';
-          if (patterns.some(p => p.test(txt))) { el.click(); return true; }
+          if (patterns.some(p => p.test(txt))) { el.scrollIntoView({ block: 'center' }); el.click(); return true; }
         }
         return false;
       });
@@ -263,7 +281,6 @@ async function postComment(page, commentText, commentImages, label) {
     if (commentImages && commentImages.length > 0) {
       const validImages = commentImages.filter(p => fs.existsSync(p));
       if (validImages.length > 0) {
-        // Click the photo/attachment icon in the comment area
         const attachClicked = await page.evaluate(() => {
           const patterns = [/photo/i, /รูปภาพ/i, /image/i, /attach/i];
           for (const el of document.querySelectorAll('[role="button"], button, label')) {
@@ -277,12 +294,10 @@ async function postComment(page, commentText, commentImages, label) {
           await sleep(1500);
           const imgInput = await page.$('input[type="file"]');
           if (imgInput) {
-            // Upload all comment images
-            for (const imgPath of validImages) {
-              await imgInput.uploadFile(imgPath);
-              await sleep(2000);
-              console.log(`    📎 ${label} image attached: ${path.basename(imgPath)}`);
-            }
+            // Upload all comment images in one call
+            await imgInput.uploadFile(...validImages);
+            await sleep(2000);
+            console.log(`    📎 ${label} ${validImages.length} image(s) attached`);
           }
         } else {
           console.log(`  ⚠️ ${label}: No attach button found, skipping images`);
@@ -297,9 +312,21 @@ async function postComment(page, commentText, commentImages, label) {
       await sleep(800);
     }
 
-    // Submit with Enter
+    // Submit: try Enter first, then Ctrl+Enter as fallback
     await page.keyboard.press('Enter');
-    await sleep(3000);
+    await sleep(2000);
+
+    // Check if the box still has content (Enter didn't submit) → try Ctrl+Enter
+    const stillHasContent = await page.evaluate(() => {
+      const el = document.activeElement;
+      return el && el.textContent && el.textContent.trim().length > 0;
+    });
+    if (stillHasContent) {
+      await page.keyboard.down('Control');
+      await page.keyboard.press('Enter');
+      await page.keyboard.up('Control');
+      await sleep(2000);
+    }
 
     console.log(`  ✅ ${label} posted!`);
     return true;
@@ -365,6 +392,15 @@ async function runPoster() {
         if (!composerOpened) throw new Error('Could not open post composer');
         await sleep(2000);
 
+        // Re-click the contenteditable to guarantee focus before typing
+        const focused = await page.evaluate(() => {
+          const el = document.querySelector('[contenteditable="true"]');
+          if (el) { el.focus(); el.click(); return true; }
+          return false;
+        });
+        if (!focused) throw new Error('Could not focus composer');
+        await sleep(500);
+
         await page.keyboard.type(session.caption, { delay: rand(30, 80) });
         await sleep(1500);
 
@@ -401,7 +437,7 @@ async function runPoster() {
 
         // Wait between groups (skip wait on last)
         if (i < pending.length - 1) {
-          const wait = 20  * 1000 + rand(0, 15000);
+          const wait = 1 * 60 * 1000 + rand(0, 60000);
           console.log(`  ⏳ Waiting ${Math.round(wait/60000)} min before next group...`);
           await sleep(wait);
         }
