@@ -401,7 +401,7 @@ async function runPoster() {
 
         // Wait between groups (skip wait on last)
         if (i < pending.length - 1) {
-          const wait = 1 * 60 * 1000 + rand(0, 60000);
+          const wait = 20  * 1000 + rand(0, 15000);
           console.log(`  ⏳ Waiting ${Math.round(wait/60000)} min before next group...`);
           await sleep(wait);
         }
