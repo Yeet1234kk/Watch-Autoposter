@@ -1,5 +1,5 @@
 /**
- * Watch Auto-Poster — Railway Server (Fixed Version)
+ * Watch Auto-Poster — Railway Server (Fixed Image & Post Version)
  * Runs 24/7 on Railway. Controls Puppeteer in the background.
  * Your Vercel app talks to this server from anywhere.
  */
@@ -122,41 +122,20 @@ function launchBrowser() {
   });
 }
 
-async function uploadImages(page, imagePaths) {
-  const validPaths = imagePaths.filter(p => fs.existsSync(p));
-  if (!validPaths.length) return;
+async function openComposer(page) {
+  await sleep(3000);
 
-  console.log(`  📸 Preparing to upload ${validPaths.length} watch image(s)...`);
-
-  for (let i = 0; i < validPaths.length; i++) {
-    const currentPath = validPaths[i];
-    
-    // Find the file input field again on each iteration as the DOM might refresh
-    let input = await page.$('input[type="file"][accept*="image"]');
-    if (!input) {
-      await page.evaluate(() => {
-        for (const b of document.querySelectorAll('[role="button"]')) {
-          if (/photo|video|รูปภาพ|วิดีโอ/i.test(b.textContent)) { b.click(); return; }
-        }
-      });
-      await sleep(2000);
-      input = await page.$('input[type="file"]');
-    }
-
-    if (input) {
-      // Upload one file at a time to prevent the "multiple" attribute error
-      await input.uploadFile(currentPath);
-      console.log(`    📎 Image [${i + 1}/${validPaths.length}] attached successfully.`);
-      
-      // Short delay between uploads so Facebook's UI can process the file sequential addition
-      await sleep(2500); 
-    } else {
-      console.error(`    ❌ Could not find the file input element for image ${i + 1}`);
-    }
-  }
-  
-  console.log(`  ✅ All ${validPaths.length} image(s) uploaded successfully!`);
-}
+  const selectors = [
+    '[aria-label="Write something to the group…"]',
+    '[aria-label="Write something to the group..."]',
+    '[aria-label="Write something..."]',
+    '[aria-label="Create a public post…"]',
+    '[aria-label="Create a public post..."]',
+    '[aria-label="What\'s on your mind?"]',
+    '[data-testid="status-attachment-mentions-input"]',
+    'div[contenteditable="true"]',
+    '[role="textbox"]'
+  ];
 
   for (const sel of selectors) {
     try {
@@ -207,24 +186,41 @@ async function uploadImages(page, imagePaths) {
   return false;
 }
 
+// ─── FIXED MULTIPLE IMAGE UPLOADER ───
 async function uploadImages(page, imagePaths) {
   const validPaths = imagePaths.filter(p => fs.existsSync(p));
   if (!validPaths.length) return;
 
-  let input = await page.$('input[type="file"][accept*="image"]');
-  if (!input) {
-    await page.evaluate(() => {
-      for (const b of document.querySelectorAll('[role="button"]')) {
-        if (/photo|video/i.test(b.textContent)) { b.click(); return; }
-      }
-    });
-    await sleep(2000);
-    input = await page.$('input[type="file"]');
+  console.log(`  📸 Preparing to upload ${validPaths.length} watch image(s)...`);
+
+  for (let i = 0; i < validPaths.length; i++) {
+    const currentPath = validPaths[i];
+    
+    // Find the file input field again on each iteration as the DOM might change
+    let input = await page.$('input[type="file"][accept*="image"]');
+    if (!input) {
+      await page.evaluate(() => {
+        for (const b of document.querySelectorAll('[role="button"]')) {
+          if (/photo|video|รูปภาพ|วิดีโอ/i.test(b.textContent)) { b.click(); return; }
+        }
+      });
+      await sleep(2000);
+      input = await page.$('input[type="file"]');
+    }
+
+    if (input) {
+      // Upload one file at a time to circumvent the "multiple" attribute restriction error
+      await input.uploadFile(currentPath);
+      console.log(`    📎 Image [${i + 1}/${validPaths.length}] attached successfully.`);
+      
+      // Short delay between uploads so Facebook's UI can cleanly handle sequential additions
+      await sleep(2500); 
+    } else {
+      console.error(`    ❌ Could not find the file input element for image ${i + 1}`);
+    }
   }
-  if (input) {
-    await input.uploadFile(...validPaths);
-    console.log(`  📎 ${validPaths.length} image(s) uploaded`);
-  }
+  
+  console.log(`  ✅ All ${validPaths.length} image(s) processed.`);
 }
 
 async function clickPost(page) {
@@ -245,7 +241,6 @@ async function clickPost(page) {
       if (btn) {
         const isCorrectButton = await btn.evaluate(el => {
           const text = (el.innerText || el.textContent || '').trim();
-          // Verify it's either explicitly the post button or match common text labels
           return el.getAttribute('aria-label') === 'Post' || 
                  el.getAttribute('aria-label') === 'โพสต์' || 
                  text === 'Post' || text === 'โพสต์';
@@ -271,7 +266,6 @@ async function clickPost(page) {
     for (const el of elements) {
       const text = (el.innerText || el.textContent || "").trim();
       if (targets.includes(text)) {
-        // Double check it's not disabled
         if (!el.disabled && el.getAttribute('aria-disabled') !== 'true') {
           el.click();
           return text;
@@ -286,13 +280,12 @@ async function clickPost(page) {
     return true;
   }
 
-  // 3. Ultimate Fallback: Emulate the Keyboard Hotkey sequence (Ctrl + Enter submits forms on Facebook)
+  // 3. Ultimate Fallback: Emulate Keyboard Hotkey sequence (Ctrl + Enter submits forms on Facebook)
   console.log('   ⚠️ Visual buttons missed. Firing global keyboard hotkey fallback (Ctrl + Enter)...');
   await page.keyboard.down('Control');
   await page.keyboard.press('Enter');
   await page.keyboard.up('Control');
   
-  // Give it an extra moment to process the submit
   await sleep(4000);
   return true; 
 }
@@ -353,7 +346,6 @@ async function runPoster() {
         await page.goto(group.link, { waitUntil: 'networkidle2', timeout: 30000 });
         await sleep(4000 + rand(0, 2000));
 
-        // Log page after navigation
         const gTitle = await page.title();
         const gUrl = page.url();
         console.log(`  📄 ${gTitle} | ${gUrl}`);
@@ -367,7 +359,7 @@ async function runPoster() {
 
         if (session.imagePaths.length > 0) {
           await uploadImages(page, session.imagePaths);
-          await sleep(5000); // Increased wait time to let watch images fully encode/render
+          await sleep(5000); // Wait time to let final imagery resolve rendering elements
         }
 
         const posted = await clickPost(page);
@@ -378,7 +370,6 @@ async function runPoster() {
         session.progress.done++;
         console.log(`  ✅ Posted!`);
 
-        // Refresh cookies after successful post
         const updatedCookies = await page.cookies();
         fs.writeFileSync('/tmp/fb-cookies.json', JSON.stringify(updatedCookies));
 
